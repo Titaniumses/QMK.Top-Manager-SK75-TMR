@@ -9,6 +9,7 @@ import win32process
 import psutil
 import keyboard
 from winotify import Notification
+from battery import BatteryMonitor, BatteryState
 
 CONFIG_FILE = "profiles_config.json"
 
@@ -20,6 +21,14 @@ class QMKManager:
         self.is_running = False
         self.worker_thread = None
         self.usb_lock = threading.Lock()
+        self.app_alive = True
+        self.tray = None  # set by Task 8 (TrayIcon integration)
+        self.battery_monitor = BatteryMonitor(
+            config_battery=self.config["battery"],
+            usb_lock=self.usb_lock,
+            get_device_path=self.get_keyboard_path_safe,
+        )
+        self.battery_thread = None
         self.current_binding = None
         self.last_active_window = None
         self.binds_dict = {}
@@ -32,6 +41,9 @@ class QMKManager:
         self.refresh_devices()
         self.update_payloads_list()
         self.update_bindings_list()
+
+        self.battery_thread = threading.Thread(target=self.battery_poll_loop, daemon=True)
+        self.battery_thread.start()
 
     # ---------- Config ----------
     def load_config(self):
@@ -765,6 +777,32 @@ class QMKManager:
             if d['usage_page'] == usage_page:
                 return d['path']
         return None
+
+    def get_keyboard_path_safe(self):
+        """Like get_keyboard_path but returns None if device isn't configured."""
+        if not self.config.get("device"):
+            return None
+        return self.get_keyboard_path()
+
+    def battery_poll_loop(self):
+        print("[Battery] Поток опроса батареи запущен (каждые 60 сек).")
+        while self.app_alive:
+            try:
+                self.battery_monitor.read_once()
+                state = self.battery_monitor.state
+                if self.tray:
+                    self.tray.update_battery(state)
+                self.publish_battery_to_ui(state)
+            except Exception as e:
+                print(f"[Battery] Ошибка цикла опроса: {e}")
+            for _ in range(60):
+                if not self.app_alive:
+                    return
+                time.sleep(1)
+
+    def publish_battery_to_ui(self, state: BatteryState):
+        # Wired by Task 10 (header battery badge). Stub for now.
+        pass
 
     def apply_payload(self, profile_name, payload_data, manual=False):
         with self.usb_lock:
