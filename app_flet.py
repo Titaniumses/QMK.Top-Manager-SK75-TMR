@@ -39,7 +39,20 @@ class QMKManager:
             "device": None,
             "mode": "auto",
             "payloads": {},
-            "bindings": []
+            "bindings": [],
+            "settings": {
+                "start_minimized": False,
+                "autostart_service": True,
+            },
+            "battery": {
+                "query": [],
+                "report_id": 0,
+                "response_length": 32,
+                "response_offset": 0,
+                "response_scale": 1,
+                "charging_offset": None,
+                "charging_mask": 0,
+            },
         }
         if os.path.exists(CONFIG_FILE):
             try:
@@ -58,6 +71,16 @@ class QMKManager:
                         for b in data["bindings"]:
                             if "hotkey" in b:
                                 del b["hotkey"]
+                    if "settings" not in data:
+                        data["settings"] = default_config["settings"]
+                    else:
+                        for k, v in default_config["settings"].items():
+                            data["settings"].setdefault(k, v)
+                    if "battery" not in data:
+                        data["battery"] = default_config["battery"]
+                    else:
+                        for k, v in default_config["battery"].items():
+                            data["battery"].setdefault(k, v)
                     return data
             except Exception:
                 pass
