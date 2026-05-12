@@ -10,6 +10,7 @@ import psutil
 import keyboard
 from winotify import Notification
 from battery import BatteryMonitor, BatteryState
+from tray import TrayIcon
 
 CONFIG_FILE = "profiles_config.json"
 
@@ -22,7 +23,14 @@ class QMKManager:
         self.worker_thread = None
         self.usb_lock = threading.Lock()
         self.app_alive = True
-        self.tray = None  # set by Task 8 (TrayIcon integration)
+        self._first_minimize_notified = False
+        self.tray = TrayIcon(
+            on_toggle_window=self._tray_toggle_window,
+            on_show=self._tray_show_window,
+            on_hide=self._tray_hide_window,
+            on_quit=self._tray_quit,
+        )
+        self.tray.start()
         self.battery_monitor = BatteryMonitor(
             config_battery=self.config["battery"],
             usb_lock=self.usb_lock,
@@ -152,6 +160,9 @@ class QMKManager:
             use_material3=True,
         )
         self.page.bgcolor = ft.Colors.SURFACE
+
+        self.page.window_prevent_close = True
+        self.page.on_window_event = self._handle_window_event
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -877,6 +888,87 @@ class QMKManager:
             except Exception as e:
                 print(f"[GLOBAL ERROR] Сбой в цикле сканирования: {e}")
             time.sleep(1)
+
+    # ---------- Tray callbacks (run on pystray thread) ----------
+    def _ui_call(self, fn):
+        """Marshal a UI mutation onto Flet's event loop."""
+        try:
+            self.page.run_thread(fn)
+        except Exception:
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _tray_show_window(self):
+        def do():
+            self.page.window_visible = True
+            try:
+                self.page.window_to_front()
+            except Exception:
+                pass
+            self.page.update()
+            self.tray.set_window_visible(True)
+        self._ui_call(do)
+
+    def _tray_hide_window(self):
+        def do():
+            self.page.window_visible = False
+            self.page.update()
+            self.tray.set_window_visible(False)
+        self._ui_call(do)
+
+    def _tray_toggle_window(self):
+        def do():
+            visible = bool(getattr(self.page, "window_visible", True))
+            if visible:
+                self.page.window_visible = False
+                self.tray.set_window_visible(False)
+            else:
+                self.page.window_visible = True
+                try:
+                    self.page.window_to_front()
+                except Exception:
+                    pass
+                self.tray.set_window_visible(True)
+            self.page.update()
+        self._ui_call(do)
+
+    def _tray_quit(self):
+        self.app_alive = False
+        self.is_running = False
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        try:
+            self.tray.stop()
+        except Exception:
+            pass
+        def do():
+            try:
+                self.page.window_destroy()
+            except Exception:
+                pass
+        self._ui_call(do)
+
+    def _handle_window_event(self, e):
+        if e.data == "close":
+            self.page.window_visible = False
+            self.page.update()
+            if self.tray:
+                self.tray.set_window_visible(False)
+            if not self._first_minimize_notified:
+                self._first_minimize_notified = True
+                try:
+                    Notification(
+                        app_id='QMK Manager',
+                        title='QMK Manager',
+                        msg='Программа продолжает работать в трее. Выйти можно из меню иконки.',
+                        duration='short',
+                    ).show()
+                except Exception:
+                    pass
 
     # ---------- Utilities ----------
     def _snack(self, text):
