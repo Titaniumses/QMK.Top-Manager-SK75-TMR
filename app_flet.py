@@ -130,6 +130,10 @@ class QMKManager:
         if self.is_running:
             self._set_status(True)
 
+    def _set_setting(self, key, value):
+        self.config.setdefault("settings", {})[key] = bool(value)
+        self.save_config()
+
     def reload_runtime_state(self):
         try:
             keyboard.unhook_all()
@@ -195,6 +199,25 @@ class QMKManager:
             border_radius=100,
         )
 
+        self.battery_chip_icon = ft.Icon(ft.Icons.BATTERY_UNKNOWN, size=16, color=ft.Colors.ON_SURFACE_VARIANT)
+        self.battery_chip_text = ft.Text("—", size=12, weight=ft.FontWeight.W_500)
+        self.battery_chip_refresh = ft.IconButton(
+            icon=ft.Icons.REFRESH_ROUNDED,
+            icon_size=14,
+            tooltip="Обновить уровень батареи",
+            on_click=lambda e: threading.Thread(target=self._manual_battery_refresh, daemon=True).start(),
+        )
+        self.battery_chip = ft.Container(
+            content=ft.Row(
+                [self.battery_chip_icon, self.battery_chip_text, self.battery_chip_refresh],
+                spacing=4, tight=True,
+            ),
+            padding=ft.Padding.symmetric(horizontal=10, vertical=4),
+            bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+            border_radius=100,
+            tooltip="Уровень заряда клавиатуры",
+        )
+
         header = ft.Container(
             content=ft.Row(
                 [
@@ -219,7 +242,7 @@ class QMKManager:
                         ],
                         spacing=12,
                     ),
-                    self.status_badge,
+                    ft.Row([self.battery_chip, self.status_badge], spacing=8),
                 ],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             ),
@@ -319,6 +342,61 @@ class QMKManager:
             ),
         )
 
+        settings = self.config.get("settings", {})
+
+        self.start_minimized_switch = ft.Switch(
+            value=settings.get("start_minimized", False),
+            on_change=lambda e: self._set_setting("start_minimized", e.control.value),
+        )
+        self.autostart_switch = ft.Switch(
+            value=settings.get("autostart_service", True),
+            on_change=lambda e: self._set_setting("autostart_service", e.control.value),
+        )
+
+        settings_card = self._card(
+            icon=ft.Icons.SETTINGS_ROUNDED,
+            title="Настройки запуска",
+            subtitle="Применяются при следующем запуске программы.",
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text("Запускать свёрнутым в трей", size=13),
+                                    ft.Text(
+                                        "При старте окно будет скрыто, видна только иконка в трее.",
+                                        size=11, color=ft.Colors.ON_SURFACE_VARIANT, italic=True,
+                                    ),
+                                ],
+                                spacing=2, expand=True,
+                            ),
+                            self.start_minimized_switch,
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Divider(height=1, opacity=0.2),
+                    ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text("Автоматически запускать службу", size=13),
+                                    ft.Text(
+                                        "Фоновое переключение профилей включится сразу после запуска.",
+                                        size=11, color=ft.Colors.ON_SURFACE_VARIANT, italic=True,
+                                    ),
+                                ],
+                                spacing=2, expand=True,
+                            ),
+                            self.autostart_switch,
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                ],
+                spacing=12,
+            ),
+        )
+
         self.toggle_button = ft.FilledButton(
             "Запустить службу",
             icon=ft.Icons.PLAY_ARROW_ROUNDED,
@@ -347,6 +425,7 @@ class QMKManager:
                     device_card,
                     profiles_card,
                     bindings_card,
+                    settings_card,
                 ],
                 spacing=16,
                 scroll=ft.ScrollMode.AUTO,
@@ -827,8 +906,35 @@ class QMKManager:
                 time.sleep(1)
 
     def publish_battery_to_ui(self, state: BatteryState):
-        # Wired by Task 10 (header battery badge). Stub for now.
-        pass
+        def do():
+            if state.is_stale or state.percent is None:
+                self.battery_chip_icon.name = ft.Icons.BATTERY_UNKNOWN
+                self.battery_chip_icon.color = ft.Colors.ON_SURFACE_VARIANT
+                self.battery_chip_text.value = "—"
+            else:
+                if state.percent >= 50:
+                    self.battery_chip_icon.name = ft.Icons.BATTERY_FULL_ROUNDED
+                    self.battery_chip_icon.color = ft.Colors.TERTIARY
+                elif state.percent >= 20:
+                    self.battery_chip_icon.name = ft.Icons.BATTERY_3_BAR_ROUNDED
+                    self.battery_chip_icon.color = ft.Colors.SECONDARY
+                else:
+                    self.battery_chip_icon.name = ft.Icons.BATTERY_ALERT_ROUNDED
+                    self.battery_chip_icon.color = ft.Colors.ERROR
+                suffix = " ⚡" if state.charging else ""
+                self.battery_chip_text.value = f"{state.percent}%{suffix}"
+            try:
+                self.page.update()
+            except Exception:
+                pass
+        self._ui_call(do)
+
+    def _manual_battery_refresh(self):
+        self.battery_monitor.read_once()
+        state = self.battery_monitor.state
+        if self.tray:
+            self.tray.update_battery(state)
+        self.publish_battery_to_ui(state)
 
     def apply_payload(self, profile_name, payload_data, manual=False):
         with self.usb_lock:
