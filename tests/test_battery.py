@@ -60,3 +60,76 @@ def test_initial_state_is_unknown_and_stale():
     assert monitor.state.percent is None
     assert monitor.state.is_stale is True
     assert monitor.state.charging is False
+
+
+def test_read_once_parses_percent_at_offset():
+    fake = FakeHidDevice(response_bytes=[0xAA, 0xBB, 87, 0, 0, 0, 0, 0])
+    monitor = make_monitor(fake)
+    monitor.read_once()
+    assert monitor.state.percent == 87
+    assert monitor.state.is_stale is False
+    assert monitor.state.charging is False
+    assert fake.sent == [[0, 0xAB, 0xCD]]
+    assert fake.closed is True
+
+
+def test_read_once_applies_response_scale():
+    fake = FakeHidDevice(response_bytes=[0, 0, 50, 0, 0, 0, 0, 0])
+    config = {
+        "query": [0x01],
+        "report_id": 0,
+        "response_length": 8,
+        "response_offset": 2,
+        "response_scale": 2,
+        "charging_offset": None,
+        "charging_mask": 0,
+    }
+    monitor = make_monitor(fake, config_battery=config)
+    monitor.read_once()
+    assert monitor.state.percent == 100  # 50 * 2
+
+
+def test_read_once_clamps_above_100():
+    fake = FakeHidDevice(response_bytes=[0, 0, 200, 0, 0, 0, 0, 0])
+    monitor = make_monitor(fake)
+    monitor.read_once()
+    assert monitor.state.percent == 100
+
+
+def test_read_once_clamps_below_0():
+    # Negative shouldn't happen, but guard anyway. response_scale=-1 to force it.
+    fake = FakeHidDevice(response_bytes=[0, 0, 5, 0, 0, 0, 0, 0])
+    config = {
+        "query": [0x01], "report_id": 0, "response_length": 8,
+        "response_offset": 2, "response_scale": -1,
+        "charging_offset": None, "charging_mask": 0,
+    }
+    monitor = make_monitor(fake, config_battery=config)
+    monitor.read_once()
+    assert monitor.state.percent == 0
+
+
+def test_read_once_detects_charging():
+    # Bit 7 set in byte 3 means charging.
+    fake = FakeHidDevice(response_bytes=[0, 0, 60, 0x80, 0, 0, 0, 0])
+    config = {
+        "query": [0x01], "report_id": 0, "response_length": 8,
+        "response_offset": 2, "response_scale": 1,
+        "charging_offset": 3, "charging_mask": 0x80,
+    }
+    monitor = make_monitor(fake, config_battery=config)
+    monitor.read_once()
+    assert monitor.state.percent == 60
+    assert monitor.state.charging is True
+
+
+def test_read_once_charging_false_when_mask_unset():
+    fake = FakeHidDevice(response_bytes=[0, 0, 60, 0x00, 0, 0, 0, 0])
+    config = {
+        "query": [0x01], "report_id": 0, "response_length": 8,
+        "response_offset": 2, "response_scale": 1,
+        "charging_offset": 3, "charging_mask": 0x80,
+    }
+    monitor = make_monitor(fake, config_battery=config)
+    monitor.read_once()
+    assert monitor.state.charging is False
