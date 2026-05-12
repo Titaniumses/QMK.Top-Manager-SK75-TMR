@@ -133,3 +133,60 @@ def test_read_once_charging_false_when_mask_unset():
     monitor = make_monitor(fake, config_battery=config)
     monitor.read_once()
     assert monitor.state.charging is False
+
+
+def test_read_once_no_device_path_marks_stale():
+    fake = FakeHidDevice(response_bytes=[0, 0, 50, 0, 0, 0, 0, 0])
+    config = {
+        "query": [0x01], "report_id": 0, "response_length": 8,
+        "response_offset": 2, "response_scale": 1,
+        "charging_offset": None, "charging_mask": 0,
+    }
+    monitor = BatteryMonitor(
+        config_battery=config,
+        usb_lock=threading.Lock(),
+        get_device_path=lambda: None,
+        hid_device_factory=lambda: fake,
+    )
+    monitor.read_once()
+    assert monitor.state.percent is None
+    assert monitor.state.is_stale is True
+
+
+def test_read_once_open_failure_marks_stale():
+    fake = FakeHidDevice(raise_on_open=True)
+    monitor = make_monitor(fake)
+    monitor.read_once()
+    assert monitor.state.percent is None
+    assert monitor.state.is_stale is True
+
+
+def test_read_once_send_failure_marks_stale_and_closes():
+    fake = FakeHidDevice(response_bytes=[0]*8, raise_on_send=True)
+    monitor = make_monitor(fake)
+    monitor.read_once()
+    assert monitor.state.percent is None
+    assert monitor.state.is_stale is True
+    assert fake.closed is True
+
+
+def test_read_once_short_response_marks_stale():
+    fake = FakeHidDevice(response_bytes=[0, 0])  # offset 2 will IndexError
+    monitor = make_monitor(fake)
+    monitor.read_once()
+    assert monitor.state.percent is None
+    assert monitor.state.is_stale is True
+
+
+def test_read_once_does_not_retain_previous_value_on_failure():
+    fake_good = FakeHidDevice(response_bytes=[0, 0, 75, 0, 0, 0, 0, 0])
+    monitor = make_monitor(fake_good)
+    monitor.read_once()
+    assert monitor.state.percent == 75
+
+    # Now swap factory to a failing device.
+    fake_bad = FakeHidDevice(raise_on_open=True)
+    monitor._make_device = lambda: fake_bad
+    monitor.read_once()
+    assert monitor.state.percent is None  # Last good value NOT retained.
+    assert monitor.state.is_stale is True
