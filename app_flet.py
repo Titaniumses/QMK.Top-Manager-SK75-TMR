@@ -50,6 +50,18 @@ class QMKManager:
         self.update_payloads_list()
         self.update_bindings_list()
 
+        if self.config.get("settings", {}).get("start_minimized", False):
+            self.tray.set_window_visible(False)
+
+        if self.config.get("settings", {}).get("autostart_service", True):
+            def auto_start():
+                if self.config.get("device") and self.device_dropdown.value is not None:
+                    self.toggle_service()
+            try:
+                self.page.run_thread(auto_start)
+            except Exception:
+                auto_start()
+
         self.battery_thread = threading.Thread(target=self.battery_poll_loop, daemon=True)
         self.battery_thread.start()
 
@@ -163,6 +175,9 @@ class QMKManager:
 
         self.page.window_prevent_close = True
         self.page.on_window_event = self._handle_window_event
+
+        if self.config.get("settings", {}).get("start_minimized", False):
+            self.page.window_visible = False
 
     # ---------- UI ----------
     def _build_ui(self):
