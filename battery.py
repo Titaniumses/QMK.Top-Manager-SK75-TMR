@@ -39,7 +39,11 @@ class BatteryMonitor:
             self._mark_failure("device path unavailable")
             return
         with self._usb_lock:
-            device = self._make_device()
+            try:
+                device = self._make_device()
+            except Exception as exc:
+                self._mark_failure(f"device construction failed: {exc}")
+                return
             try:
                 device.open_path(path)
                 device.set_nonblocking(1)

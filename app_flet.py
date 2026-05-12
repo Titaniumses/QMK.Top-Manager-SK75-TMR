@@ -30,7 +30,6 @@ class QMKManager:
             on_hide=self._tray_hide_window,
             on_quit=self._tray_quit,
         )
-        self.tray.start()
         self.battery_monitor = BatteryMonitor(
             config_battery=self.config["battery"],
             usb_lock=self.usb_lock,
@@ -49,6 +48,8 @@ class QMKManager:
         self.refresh_devices()
         self.update_payloads_list()
         self.update_bindings_list()
+
+        self.tray.start()
 
         if self.config.get("settings", {}).get("start_minimized", False):
             self.tray.set_window_visible(False)
@@ -103,16 +104,29 @@ class QMKManager:
                         for b in data["bindings"]:
                             if "hotkey" in b:
                                 del b["hotkey"]
+                    mutated = False
                     if "settings" not in data:
                         data["settings"] = default_config["settings"]
+                        mutated = True
                     else:
                         for k, v in default_config["settings"].items():
-                            data["settings"].setdefault(k, v)
+                            if k not in data["settings"]:
+                                data["settings"][k] = v
+                                mutated = True
                     if "battery" not in data:
                         data["battery"] = default_config["battery"]
+                        mutated = True
                     else:
                         for k, v in default_config["battery"].items():
-                            data["battery"].setdefault(k, v)
+                            if k not in data["battery"]:
+                                data["battery"][k] = v
+                                mutated = True
+                    if mutated:
+                        try:
+                            with open(CONFIG_FILE, 'w', encoding='utf-8') as wf:
+                                json.dump(data, wf, indent=4, ensure_ascii=False)
+                        except Exception:
+                            pass
                     return data
             except Exception:
                 pass
