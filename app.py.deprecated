@@ -1,0 +1,453 @@
+﻿import tkinter as tk
+from tkinter import ttk, messagebox
+import hid
+import json
+import os
+import threading
+import time
+import win32gui
+import win32process
+import psutil
+import keyboard
+from winotify import Notification
+
+CONFIG_FILE = "profiles_config.json"
+
+class KeyboardManagerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("QMK Profile Manager Pro v3")
+        self.root.geometry("750x750")
+        
+        self.config = self.load_config()
+        self.is_running = False
+        self.worker_thread = None
+        self.usb_lock = threading.Lock()
+        
+        self.current_binding = None
+        self.last_active_window = None
+
+        self.setup_ui()
+
+    def load_config(self):
+        default_config = {
+            "device": None, 
+            "mode": "auto",
+            "payloads": {}, # Теперь: {"Gaming": {"data": [0x04...], "hotkey": "alt+1"}}
+            "bindings": []  # Теперь: [{"process": "cs2.exe", "profile_name": "Gaming"}]
+        }
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    
+                    # Миграция: переносим хоткеи из старых биндингов в профили (если они были)
+                    # и конвертируем старые списки байт в словари
+                    if "payloads" in data:
+                        for k, v in list(data["payloads"].items()):
+                            if isinstance(v, list):
+                                old_hk = ""
+                                if "bindings" in data:
+                                    for b in data["bindings"]:
+                                        if b.get("profile_name") == k and b.get("hotkey"):
+                                            old_hk = b["hotkey"]
+                                data["payloads"][k] = {"data": v, "hotkey": old_hk}
+                                
+                    if "bindings" in data:
+                        for b in data["bindings"]:
+                            if "hotkey" in b:
+                                del b["hotkey"] # Очищаем старые поля
+                                
+                    return data
+            except:
+                pass
+        return default_config
+
+    def save_config(self):
+        self.config["mode"] = self.mode_var.get()
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.config, f, indent=4, ensure_ascii=False)
+        if self.is_running:
+            self.reload_runtime_state()
+
+    def reload_runtime_state(self):
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        registered = 0
+        for prof_name, info in self.config["payloads"].items():
+            hk = info.get("hotkey")
+            if not hk:
+                continue
+            try:
+                keyboard.add_hotkey(
+                    hk,
+                    lambda name=prof_name, data=info["data"]: self.apply_payload(name, data, manual=True)
+                )
+                registered += 1
+            except Exception as e:
+                print(f"[Хоткей] Ошибка регистрации {hk}: {e}")
+        self.binds_dict = {b["process"]: b["profile_name"] for b in self.config["bindings"]}
+        self.default_profile_name = self.binds_dict.get("default")
+        self.last_active_window = None
+        print(f"[Reload] Хоткеев: {registered}, биндингов: {len(self.binds_dict)}")
+
+    def setup_ui(self):
+        # --- Блок выбора режима ---
+        mode_frame = ttk.LabelFrame(self.root, text="Режим работы")
+        mode_frame.pack(fill="x", padx=10, pady=5)
+
+        self.mode_var = tk.StringVar(value=self.config.get("mode", "auto"))
+        
+        self.radio_auto = ttk.Radiobutton(mode_frame, text="Автоматически (По активному окну + Хоткеи)", variable=self.mode_var, value="auto", command=self.save_config)
+        self.radio_auto.pack(anchor="w", padx=10, pady=2)
+        
+        self.radio_manual = ttk.Radiobutton(mode_frame, text="Вручную (Только Хоткеи)", variable=self.mode_var, value="manual", command=self.save_config)
+        self.radio_manual.pack(anchor="w", padx=10, pady=2)
+
+        # --- Блок выбора устройства ---
+        device_frame = ttk.LabelFrame(self.root, text="Настройки устройства")
+        device_frame.pack(fill="x", padx=10, pady=5)
+
+        self.device_combo = ttk.Combobox(device_frame, state="readonly", width=100)
+        self.device_combo.pack(padx=5, pady=5)
+        
+        self.btn_refresh = ttk.Button(device_frame, text="Обновить список HID", command=self.refresh_devices)
+        self.btn_refresh.pack(pady=5)
+
+        # --- Блок 1: БАЗА ПРОФИЛЕЙ (Массивы байт + Хоткеи) ---
+        payloads_frame = ttk.LabelFrame(self.root, text="1. База профилей (Настройки железа и Горячие клавиши)")
+        payloads_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.payloads_listbox = tk.Listbox(payloads_frame, font=("Consolas", 10), height=5)
+        self.payloads_listbox.pack(fill="both", expand=True, padx=5, pady=5)
+
+        btn_frame1 = ttk.Frame(payloads_frame)
+        btn_frame1.pack(fill="x", padx=5, pady=5)
+        ttk.Button(btn_frame1, text="Добавить профиль", command=lambda: self.open_payload_dialog("Добавить")).pack(side="left", padx=5)
+        ttk.Button(btn_frame1, text="Редактировать", command=self.edit_payload).pack(side="left", padx=5)
+        ttk.Button(btn_frame1, text="Удалить", command=self.delete_payload).pack(side="left", padx=5)
+
+        # --- Блок 2: ПРИВЯЗКИ (Процессы) ---
+        bindings_frame = ttk.LabelFrame(self.root, text="2. Привязка профилей к процессам окон")
+        bindings_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.bindings_listbox = tk.Listbox(bindings_frame, font=("Consolas", 10), height=7)
+        self.bindings_listbox.pack(fill="both", expand=True, padx=5, pady=5)
+
+        btn_frame2 = ttk.Frame(bindings_frame)
+        btn_frame2.pack(fill="x", padx=5, pady=5)
+        ttk.Button(btn_frame2, text="Создать привязку", command=lambda: self.open_binding_dialog("Создать")).pack(side="left", padx=5)
+        ttk.Button(btn_frame2, text="Редактировать", command=self.edit_binding).pack(side="left", padx=5)
+        ttk.Button(btn_frame2, text="Удалить", command=self.delete_binding).pack(side="left", padx=5)
+
+        # --- Управление службой ---
+        control_frame = ttk.Frame(self.root)
+        control_frame.pack(fill="x", padx=10, pady=10)
+
+        self.status_label = ttk.Label(control_frame, text="Статус: Остановлено", foreground="red", font=("Arial", 10, "bold"))
+        self.status_label.pack(side="left")
+
+        self.toggle_btn = ttk.Button(control_frame, text="▶ Запустить службу", command=self.toggle_service)
+        self.toggle_btn.pack(side="right")
+
+        self.refresh_devices()
+        self.update_payloads_list()
+        self.update_bindings_list()
+
+    def refresh_devices(self):
+        self.devices = hid.enumerate()
+        custom_devices = [d for d in self.devices if d['usage_page'] >= 0xFF00]
+        
+        combo_values = []
+        for d in custom_devices:
+            name = f"{d.get('manufacturer_string', 'Unknown')} {d.get('product_string', 'Device')} [VID: {hex(d['vendor_id'])} PID: {hex(d['product_id'])} Page: {hex(d['usage_page'])}]"
+            combo_values.append(name)
+            
+        self.device_combo['values'] = combo_values
+        self.filtered_devices = custom_devices
+
+        if self.config.get("device"):
+            saved_vid = self.config["device"]["vid"]
+            saved_page = self.config["device"]["usage_page"]
+            for i, d in enumerate(custom_devices):
+                if d['vendor_id'] == saved_vid and d['usage_page'] == saved_page:
+                    self.device_combo.current(i)
+                    break
+
+    def open_payload_dialog(self, title, old_name=None):
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.geometry("550x250")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        # Данные для редактирования
+        old_data = self.config["payloads"].get(old_name, {"data": [], "hotkey": ""}) if old_name else {"data": [], "hotkey": ""}
+
+        ttk.Label(dlg, text="Название профиля (например: Gaming, Typing):").pack(pady=(10,0), padx=10, anchor="w")
+        name_var = tk.StringVar(value=old_name if old_name else "")
+        ttk.Entry(dlg, textvariable=name_var, width=70).pack(padx=10, pady=2)
+
+        ttk.Label(dlg, text="Payload (Массив байт, например: 0x04, 0x01...):").pack(pady=(10,0), padx=10, anchor="w")
+        payload_str = ", ".join([hex(x) for x in old_data["data"]]) if old_data["data"] else ""
+        p_var = tk.StringVar(value=payload_str)
+        ttk.Entry(dlg, textvariable=p_var, width=70).pack(padx=10, pady=2)
+        
+        ttk.Label(dlg, text="Горячая клавиша для этого профиля (например: ctrl+shift+1):").pack(pady=(10,0), padx=10, anchor="w")
+        hk_var = tk.StringVar(value=old_data["hotkey"])
+        ttk.Entry(dlg, textvariable=hk_var, width=70).pack(padx=10, pady=2)
+
+        def save():
+            name = name_var.get().strip()
+            p_val = p_var.get().strip()
+            hk_val = hk_var.get().strip().lower()
+            
+            if not name or not p_val:
+                messagebox.showerror("Ошибка", "Имя и Payload обязательны!", parent=dlg)
+                return
+                
+            try:
+                payload = [int(x.strip(), 16) for x in p_val.split(',')]
+                if len(payload) < 64:
+                    payload += [0] * (64 - len(payload))
+                elif len(payload) > 64:
+                    payload = payload[:64]
+                
+                if old_name and old_name != name:
+                    del self.config["payloads"][old_name]
+                    for b in self.config["bindings"]:
+                        if b["profile_name"] == old_name:
+                            b["profile_name"] = name
+                            
+                self.config["payloads"][name] = {"data": payload, "hotkey": hk_val}
+                self.save_config()
+                self.update_payloads_list()
+                self.update_bindings_list()
+                dlg.destroy()
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Неверный формат payload!\n{e}", parent=dlg)
+
+        ttk.Button(dlg, text="Сохранить", command=save).pack(pady=15)
+
+    def edit_payload(self):
+        selection = self.payloads_listbox.curselection()
+        if not selection: return
+        name = self.payloads_listbox.get(selection[0]).split(" | ")[0].replace("Имя: ", "").strip()
+        self.open_payload_dialog("Редактировать профиль", old_name=name)
+
+    def delete_payload(self):
+        selection = self.payloads_listbox.curselection()
+        if not selection: return
+        name = self.payloads_listbox.get(selection[0]).split(" | ")[0].replace("Имя: ", "").strip()
+        
+        used = [b["process"] for b in self.config["bindings"] if b["profile_name"] == name]
+        if used:
+            messagebox.showwarning("Заблокировано", f"Нельзя удалить профиль, он используется в процессах:\n{', '.join(used)}")
+            return
+            
+        del self.config["payloads"][name]
+        self.save_config()
+        self.update_payloads_list()
+
+    def update_payloads_list(self):
+        self.payloads_listbox.delete(0, tk.END)
+        for name, info in self.config["payloads"].items():
+            hk_text = f"[{info['hotkey']}]".ljust(15) if info.get('hotkey') else "[Нет]".ljust(15)
+            data = info["data"]
+            self.payloads_listbox.insert(tk.END, f"Имя: {name.ljust(15)} | Хоткей: {hk_text} | Данные: {hex(data[0])}, {hex(data[1])}...")
+
+    def open_binding_dialog(self, title, edit_idx=None):
+        if not self.config["payloads"]:
+            messagebox.showwarning("Внимание", "Сначала создайте хотя бы один Профиль в Базе профилей!")
+            return
+            
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.geometry("500x200")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        b_data = self.config["bindings"][edit_idx] if edit_idx is not None else None
+
+        ttk.Label(dlg, text="Процесс (например: cs2.exe или 'default' для базы):").pack(pady=(10,0), padx=10, anchor="w")
+        proc_var = tk.StringVar(value=b_data["process"] if b_data else "")
+        ttk.Entry(dlg, textvariable=proc_var, width=60).pack(padx=10, pady=2)
+
+        ttk.Label(dlg, text="Выбрать профиль из базы:").pack(pady=(10,0), padx=10, anchor="w")
+        prof_combo = ttk.Combobox(dlg, state="readonly", width=57, values=list(self.config["payloads"].keys()))
+        prof_combo.pack(padx=10, pady=2)
+        if b_data and b_data["profile_name"] in self.config["payloads"]:
+            prof_combo.set(b_data["profile_name"])
+        else:
+            prof_combo.current(0)
+
+        def save():
+            proc = proc_var.get().strip().lower()
+            prof_name = prof_combo.get()
+
+            if not proc or not prof_name:
+                messagebox.showerror("Ошибка", "Процесс и Профиль обязательны!", parent=dlg)
+                return
+
+            new_bind = {"process": proc, "profile_name": prof_name}
+
+            if edit_idx is not None:
+                self.config["bindings"][edit_idx] = new_bind
+            else:
+                self.config["bindings"].append(new_bind)
+
+            self.save_config()
+            self.update_bindings_list()
+            dlg.destroy()
+
+        ttk.Button(dlg, text="Сохранить", command=save).pack(pady=15)
+
+    def edit_binding(self):
+        selection = self.bindings_listbox.curselection()
+        if not selection: return
+        self.open_binding_dialog("Редактировать привязку", edit_idx=selection[0])
+
+    def delete_binding(self):
+        selection = self.bindings_listbox.curselection()
+        if not selection: return
+        del self.config["bindings"][selection[0]]
+        self.save_config()
+        self.update_bindings_list()
+
+    def update_bindings_list(self):
+        self.bindings_listbox.delete(0, tk.END)
+        for b in self.config["bindings"]:
+            self.bindings_listbox.insert(tk.END, f"Окно: {b['process'].ljust(15)} => Включает профиль: '{b['profile_name']}'")
+
+    def toggle_service(self):
+        if self.is_running:
+            self.is_running = False
+            try:
+                keyboard.unhook_all()
+            except Exception:
+                pass
+            self.status_label.config(text="Статус: Остановлено", foreground="red")
+            self.toggle_btn.config(text="▶ Запустить службу")
+        else:
+            idx = self.device_combo.current()
+            if idx == -1:
+                messagebox.showerror("Ошибка", "Выберите устройство из списка!")
+                return
+
+            selected_device = self.filtered_devices[idx]
+            self.config["device"] = {
+                "vid": selected_device["vendor_id"],
+                "pid": selected_device["product_id"],
+                "usage_page": selected_device["usage_page"]
+            }
+
+            self.is_running = True
+            self.current_binding = None
+
+            self.save_config()
+            self.reload_runtime_state()
+
+            mode_text = "АВТО" if self.mode_var.get() == "auto" else "РУЧНОЙ"
+            self.status_label.config(text=f"Статус: РАБОТАЕТ | Режим: {mode_text}", foreground="green")
+            self.toggle_btn.config(text="⏹ Остановить")
+
+            self.worker_thread = threading.Thread(target=self.background_task, daemon=True)
+            self.worker_thread.start()
+
+    def get_keyboard_path(self):
+        vid = self.config["device"]["vid"]
+        pid = self.config["device"]["pid"]
+        usage_page = self.config["device"]["usage_page"]
+        for d in hid.enumerate(vid, pid):
+            if d['usage_page'] == usage_page:
+                return d['path']
+        return None
+
+    def apply_payload(self, profile_name, payload_data, manual=False):
+        with self.usb_lock:
+            path = self.get_keyboard_path()
+            if not path: 
+                print("[Ошибка] Устройство USB не найдено для отправки.")
+                return
+
+            try:
+                device = hid.device()
+                device.open_path(path)
+                device.set_nonblocking(1)
+                device.send_feature_report([0x00] + payload_data)
+                device.close()
+                
+                if manual:
+                    try:
+                        hwnd = win32gui.GetForegroundWindow()
+                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                        self.last_active_window = psutil.Process(pid).name().lower()
+                    except:
+                        pass
+                
+                self.current_binding = profile_name
+                trigger_type = "Hotkey" if manual else "Авто"
+                
+                print(f"[{trigger_type}] Успешно применен профиль: {profile_name}")
+                
+                try:
+                    toast = Notification(
+                        app_id='QMK Manager',
+                        title=f'Профиль: {profile_name.upper()}',
+                        msg=f'Применен профиль ({trigger_type})',
+                        duration='short'
+                    )
+                    toast.show()
+                except Exception as e:
+                    print(f"[Уведомление] Ошибка: {e}")
+                    
+            except Exception as e:
+                print(f"[Ошибка USB] Не удалось отправить HID пакет: {e}")
+
+    def background_task(self):
+        print("[DEBUG] Фоновый сканер окон запущен...")
+
+        while self.is_running:
+            if self.mode_var.get() == "manual":
+                time.sleep(1)
+                continue
+
+            try:
+                hwnd = win32gui.GetForegroundWindow()
+                if hwnd:
+                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+
+                    try:
+                        active_process = psutil.Process(pid).name().lower()
+                    except psutil.AccessDenied:
+                        print(f"[ОШИБКА ДОСТУПА] Процесс защищен (PID {pid}). Нужны права Администратора!")
+                        time.sleep(2)
+                        continue
+                    except Exception:
+                        continue
+
+                    if active_process != self.last_active_window:
+                        print(f"[DEBUG] Активное окно изменилось на: '{active_process}'")
+                        self.last_active_window = active_process
+
+                        if active_process in self.binds_dict:
+                            prof_name = self.binds_dict[active_process]
+                            payload_info = self.config["payloads"].get(prof_name)
+                            if payload_info:
+                                self.apply_payload(prof_name, payload_info["data"], manual=False)
+
+                        elif self.default_profile_name and self.current_binding != self.default_profile_name:
+                            payload_info = self.config["payloads"].get(self.default_profile_name)
+                            if payload_info:
+                                self.apply_payload(self.default_profile_name, payload_info["data"], manual=False)
+            except Exception as e:
+                print(f"[GLOBAL ERROR] Сбой в цикле сканирования: {e}")
+
+            time.sleep(1)
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = KeyboardManagerApp(root)
+    root.mainloop()
