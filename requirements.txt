@@ -1,0 +1,8 @@
+flet
+hid
+pywin32
+psutil
+keyboard
+winotify
+pystray
+Pillow
