@@ -152,6 +152,64 @@ class QMKManager:
         ).lower()
         return "wireless" if any(m in haystack for m in markers) else "wired"
 
+    def _probe_battery_percent(self, hid_dev):
+        """Synchronously query battery on a specific HID device and return percent (0..100) or None.
+
+        Used by refresh_devices() to classify wired vs wireless: a working battery
+        response means wireless; no response / no sane percent means wired.
+        Tries every HID interface for this VID:PID:usage_page (some are deaf).
+        """
+        key = self._device_key_of(hid_dev)
+        entry = self.config["devices"].get(key) or {}
+        batt = entry.get("battery") or {}
+        query = batt.get("query") or []
+        if not query:
+            return None
+        report_id = batt.get("report_id", 0)
+        response_length = batt.get("response_length", 65)
+        response_offset = batt.get("response_offset", 2)
+        response_scale = batt.get("response_scale", 1)
+
+        try:
+            import hid as _hid
+        except Exception:
+            return None
+
+        vid, pid, up = hid_dev["vendor_id"], hid_dev["product_id"], hid_dev["usage_page"]
+        paths = [d["path"] for d in _hid.enumerate(vid, pid) if d.get("usage_page") == up]
+
+        with self.usb_lock:
+            for path in paths:
+                device = None
+                try:
+                    device = _hid.device()
+                    device.open_path(path)
+                    device.set_nonblocking(1)
+                    device.send_feature_report([report_id] + list(query))
+                    response = device.get_feature_report(report_id, response_length)
+                except Exception:
+                    try:
+                        if device is not None:
+                            device.close()
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    device.close()
+                except Exception:
+                    pass
+                try:
+                    raw = response[response_offset]
+                    percent = max(0, min(100, int(raw * response_scale)))
+                except (IndexError, TypeError, ValueError):
+                    continue
+                # 0% can legitimately mean a flat battery, but in wired mode the
+                # device commonly echoes zeros — accept only strictly > 0 as a
+                # reliable wireless signal.
+                if percent > 0:
+                    return percent
+        return None
+
     @staticmethod
     def _pick_active_target(current_active, present_keys, devices_cfg):
         """Decide which device key should be active after a refresh.
@@ -930,6 +988,44 @@ class QMKManager:
         custom_devices = deduped
         self.filtered_devices = custom_devices
 
+        # Make sure every present device has a config entry BEFORE we probe
+        # battery — the probe needs the saved query/parse params.
+        for d in self.filtered_devices:
+            self._ensure_device_entry(d)
+
+        # Battery probe → transport classification.
+        # Если устройство возвращает осмысленный процент заряда — это wireless.
+        # Если нет — wired (проводной режим заряд не отдаёт). Транспорт пишем
+        # в config и в дропдауне оставляем только устройства соответствующего типа.
+        probe_results = {}
+        any_wireless = False
+        for d in self.filtered_devices:
+            pct = self._probe_battery_percent(d)
+            key = self._device_key_of(d)
+            probe_results[key] = pct
+            if pct is not None:
+                any_wireless = True
+
+        cfg_dirty = False
+        for d in self.filtered_devices:
+            key = self._device_key_of(d)
+            entry = self.config["devices"].get(key)
+            if entry is None:
+                continue
+            new_transport = "wireless" if probe_results[key] is not None else "wired"
+            if entry.get("transport") != new_transport:
+                entry["transport"] = new_transport
+                cfg_dirty = True
+        if cfg_dirty:
+            self.save_config()
+
+        target_transport = "wireless" if any_wireless else "wired"
+        self.filtered_devices = [
+            d for d in self.filtered_devices
+            if (self.config["devices"].get(self._device_key_of(d)) or {}).get("transport") == target_transport
+        ]
+        custom_devices = self.filtered_devices
+
         options = []
         for i, d in enumerate(custom_devices):
             key = self._device_key_of(d)
@@ -977,10 +1073,6 @@ class QMKManager:
             options.append(ft.dropdown.Option(key=key, text=label_text, content=row))
         self.device_dropdown.options = options
 
-        # Make sure every present device has a config entry (with transport
-        # auto-detected) BEFORE deciding which one wins.
-        for d in self.filtered_devices:
-            self._ensure_device_entry(d)
         present_keys = [self._device_key_of(d) for d in self.filtered_devices]
         active_key = self.config.get("active_device")
         target_key = self._pick_active_target(active_key, present_keys, self.config["devices"])
