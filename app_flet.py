@@ -659,18 +659,7 @@ class QMKManager:
             options=[],
             on_select=lambda e: self._on_device_dropdown_changed(),
         )
-        self.transport_override = ft.SegmentedButton(
-            segments=[
-                ft.Segment(value="wired", label=ft.Text("Wired"),
-                           icon=ft.Icon(ft.Icons.USB)),
-                ft.Segment(value="wireless", label=ft.Text("Wireless"),
-                           icon=ft.Icon(ft.Icons.WIFI_TETHERING_ROUNDED)),
-            ],
-            selected=["wired"],
-            allow_multiple_selection=False,
-            allow_empty_selection=False,
-            on_change=self._on_transport_override_change,
-        )
+        self.transport_override = None
         refresh_btn = ft.IconButton(
             icon=ft.Icons.REFRESH_ROUNDED,
             tooltip="Обновить список",
@@ -697,7 +686,6 @@ class QMKManager:
                 ft.Column(
                     [
                         ft.Row([self.device_dropdown, refresh_btn], spacing=8),
-                        ft.Row([self.transport_override], spacing=8),
                         ft.Row([sniffer_open_btn], alignment=ft.MainAxisAlignment.END),
                     ],
                     spacing=10,
@@ -941,10 +929,44 @@ class QMKManager:
             label_prefix = (saved.get("label") or self._device_label_for(d)) if saved else self._device_label_for(d)
             transport = (saved or {}).get("transport") or self._detect_transport(d)
             badge = "[WIRED]" if transport == "wired" else "[WIRELESS]"
-            label = (
+            label_text = (
                 f"{badge} {label_prefix} · VID {hex(d['vendor_id'])} · PID {hex(d['product_id'])} · Page {hex(d['usage_page'])}"
             )
-            options.append(ft.dropdown.Option(key=key, text=label))
+            vid, pid, up = d['vendor_id'], d['product_id'], d['usage_page']
+            wired_btn = ft.IconButton(
+                icon=ft.Icons.USB,
+                tooltip="Пометить как проводное",
+                selected=(transport == "wired"),
+                selected_icon=ft.Icons.USB,
+                icon_color=ft.Colors.ON_SURFACE_VARIANT,
+                selected_icon_color=ft.Colors.PRIMARY,
+                style=ft.ButtonStyle(
+                    bgcolor={"selected": ft.Colors.PRIMARY_CONTAINER, "": ft.Colors.TRANSPARENT},
+                ),
+                on_click=lambda e, v=vid, p=pid, u=up: self._set_device_transport(v, p, u, "wired"),
+            )
+            wireless_btn = ft.IconButton(
+                icon=ft.Icons.WIFI_TETHERING_ROUNDED,
+                tooltip="Пометить как беспроводное",
+                selected=(transport == "wireless"),
+                selected_icon=ft.Icons.WIFI_TETHERING_ROUNDED,
+                icon_color=ft.Colors.ON_SURFACE_VARIANT,
+                selected_icon_color=ft.Colors.PRIMARY,
+                style=ft.ButtonStyle(
+                    bgcolor={"selected": ft.Colors.PRIMARY_CONTAINER, "": ft.Colors.TRANSPARENT},
+                ),
+                on_click=lambda e, v=vid, p=pid, u=up: self._set_device_transport(v, p, u, "wireless"),
+            )
+            row = ft.Row(
+                [
+                    ft.Text(label_text, expand=True, overflow=ft.TextOverflow.ELLIPSIS),
+                    wired_btn,
+                    wireless_btn,
+                ],
+                spacing=4,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            )
+            options.append(ft.dropdown.Option(key=key, content=row))
         self.device_dropdown.options = options
 
         # Make sure every present device has a config entry (with transport
@@ -2118,19 +2140,25 @@ class QMKManager:
             pass
 
     def _on_transport_override_change(self, e):
-        try:
-            selected = e.control.selected
-        except Exception:
-            selected = None
-        if not selected:
+        return
+
+    def _set_device_transport(self, vid, pid, usage_page, transport):
+        if transport not in ("wired", "wireless"):
             return
-        new_value = next(iter(selected))
-        if new_value not in ("wired", "wireless"):
-            return
-        entry = self._active_device()
+        key = self._device_key(vid, pid, usage_page)
+        entry = self.config["devices"].get(key)
         if entry is None:
-            return
-        entry["transport"] = new_value
+            hid_dev = next(
+                (d for d in getattr(self, "filtered_devices", [])
+                 if d['vendor_id'] == vid and d['product_id'] == pid and d['usage_page'] == usage_page),
+                None,
+            )
+            if hid_dev is None:
+                return
+            entry = self._empty_device_entry(vid, pid, usage_page, label=self._device_label_for(hid_dev))
+            self.config["devices"][key] = entry
+            self._normalize_device_entry(entry)
+        entry["transport"] = transport
         self.save_config()
         self.refresh_devices()
         try:
@@ -2139,17 +2167,8 @@ class QMKManager:
             pass
 
     def _sync_transport_override_ui(self):
-        btn = getattr(self, "transport_override", None)
-        if btn is None:
-            return
-        entry = self._active_device()
-        transport = entry.get("transport") if entry else None
-        if transport in ("wired", "wireless"):
-            btn.selected = [transport]
-        else:
-            btn.selected = ["wireless"]
         try:
-            btn.update()
+            self._update_transport_icon()
         except Exception:
             pass
 
