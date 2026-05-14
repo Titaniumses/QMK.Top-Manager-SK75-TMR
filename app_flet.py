@@ -377,6 +377,10 @@ class QMKManager:
             self._update_transport_icon()
         except Exception:
             pass
+        try:
+            self._sync_transport_override_ui()
+        except Exception:
+            pass
         return True
 
     def _ensure_device_entry(self, hid_dev):
@@ -635,6 +639,18 @@ class QMKManager:
             options=[],
             on_select=lambda e: self._on_device_dropdown_changed(),
         )
+        self.transport_override = ft.SegmentedButton(
+            segments=[
+                ft.Segment(value="wired", label=ft.Text("Wired"),
+                           icon=ft.Icon(ft.Icons.USB)),
+                ft.Segment(value="wireless", label=ft.Text("Wireless"),
+                           icon=ft.Icon(ft.Icons.WIFI_TETHERING_ROUNDED)),
+            ],
+            selected={"wired"},
+            allow_multiple_selection=False,
+            allow_empty_selection=False,
+            on_change=self._on_transport_override_change,
+        )
         refresh_btn = ft.IconButton(
             icon=ft.Icons.REFRESH_ROUNDED,
             tooltip="Обновить список",
@@ -661,6 +677,7 @@ class QMKManager:
                 ft.Column(
                     [
                         ft.Row([self.device_dropdown, refresh_btn], spacing=8),
+                        ft.Row([self.transport_override], spacing=8),
                         ft.Row([sniffer_open_btn], alignment=ft.MainAxisAlignment.END),
                     ],
                     spacing=10,
@@ -913,6 +930,10 @@ class QMKManager:
             self._activate_device(target_key)
         try:
             self._update_transport_icon()
+        except Exception:
+            pass
+        try:
+            self._sync_transport_override_ui()
         except Exception:
             pass
         self.page.update()
@@ -1759,6 +1780,42 @@ class QMKManager:
             icon.visible = False
         try:
             icon.update()
+        except Exception:
+            pass
+
+    def _on_transport_override_change(self, e):
+        try:
+            selected = e.control.selected
+        except Exception:
+            selected = None
+        if not selected:
+            return
+        new_value = next(iter(selected))
+        if new_value not in ("wired", "wireless"):
+            return
+        entry = self._active_device()
+        if entry is None:
+            return
+        entry["transport"] = new_value
+        self.save_config()
+        self.refresh_devices()
+        try:
+            self._update_transport_icon()
+        except Exception:
+            pass
+
+    def _sync_transport_override_ui(self):
+        btn = getattr(self, "transport_override", None)
+        if btn is None:
+            return
+        entry = self._active_device()
+        transport = entry.get("transport") if entry else None
+        if transport in ("wired", "wireless"):
+            btn.selected = {transport}
+        else:
+            btn.selected = {"wireless"}
+        try:
+            btn.update()
         except Exception:
             pass
 
