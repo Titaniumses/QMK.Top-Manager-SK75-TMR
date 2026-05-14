@@ -155,6 +155,7 @@ class QMKManager:
             "pid": int(pid),
             "usage_page": int(usage_page),
             "label": label or "",
+            "transport": None,
             "payloads": {
                 f"Профиль {i + 1}": {"data": _default_profile_payload(i), "hotkey": ""}
                 for i in range(PROFILE_COUNT)
@@ -174,6 +175,7 @@ class QMKManager:
 
     def _normalize_device_entry(self, entry):
         entry.setdefault("label", "")
+        entry.setdefault("transport", None)
         payloads = entry.get("payloads") or {}
         if not isinstance(payloads, dict):
             payloads = {}
@@ -374,14 +376,18 @@ class QMKManager:
         return True
 
     def _ensure_device_entry(self, hid_dev):
-        """Create an empty config entry for an HID device if missing. Returns key."""
+        """Create an empty config entry for an HID device if missing. Returns key.
+        Also lazily fills the `transport` field from device metadata."""
         key = self._device_key_of(hid_dev)
         if key not in self.config["devices"]:
             self.config["devices"][key] = self._empty_device_entry(
                 hid_dev["vendor_id"], hid_dev["product_id"], hid_dev["usage_page"],
                 label=self._device_label_for(hid_dev),
             )
-            self.save_config()
+        entry = self.config["devices"][key]
+        if not entry.get("transport"):
+            entry["transport"] = self._detect_transport(hid_dev)
+        self.save_config()
         return key
 
     # ---------- Profile helpers ----------

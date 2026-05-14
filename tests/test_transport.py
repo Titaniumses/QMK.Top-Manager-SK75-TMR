@@ -83,3 +83,29 @@ class TestPickActiveTarget:
     def test_first_present_when_no_transport_metadata(self):
         cfg = {"a": {}, "b": {}}
         assert QMKManager._pick_active_target(None, ["a", "b"], cfg) == "a"
+
+
+class TestTransportPersistence:
+    def _stub(self):
+        return QMKManager.__new__(QMKManager)
+
+    def test_normalize_adds_missing_transport_as_none(self):
+        mgr = self._stub()
+        entry = {"vid": 1, "pid": 2, "usage_page": 3, "label": "X",
+                 "payloads": {}, "bindings": [], "battery": {}}
+        mgr._normalize_device_entry(entry)
+        assert entry["transport"] is None
+
+    def test_normalize_preserves_existing_transport(self):
+        mgr = self._stub()
+        entry = {"vid": 1, "pid": 2, "usage_page": 3, "label": "X",
+                 "payloads": {}, "bindings": [], "battery": {},
+                 "transport": "wireless"}
+        mgr._normalize_device_entry(entry)
+        assert entry["transport"] == "wireless"
+
+    def test_empty_device_entry_has_transport_field(self):
+        mgr = self._stub()
+        entry = mgr._empty_device_entry(1, 2, 3, label="X")
+        assert "transport" in entry
+        assert entry["transport"] is None
