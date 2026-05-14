@@ -85,6 +85,13 @@ class QMKManager:
         # pattern filter and logs every TX frame (and feature-report RX) with a
         # classification tag. Per spec §4 — per-session, never persisted.
         self._sniff_learn_mode = False
+        self.bt_report_id = None
+        self.bt_response_length = None
+        self.bt_response_offset = None
+        self.bt_response_scale = None
+        self.bt_charging_offset = None
+        self.bt_charging_mask = None
+        self.bt_result = None
         self.detected_browser_path = _find_chrome()
 
         self._build_page()
@@ -377,6 +384,10 @@ class QMKManager:
                 self.worker_thread = threading.Thread(target=self.background_task, daemon=True)
                 self.worker_thread.start()
         threading.Thread(target=self._manual_battery_refresh, daemon=True).start()
+        try:
+            self._battery_test_sync_from_active()
+        except Exception:
+            pass
         try:
             self._update_transport_icon()
         except Exception:
@@ -982,6 +993,9 @@ class QMKManager:
             except Exception:
                 pass
 
+        battery_panel = self._build_battery_test_panel()
+        self._battery_test_sync_from_active()
+
         body = ft.Column(
             [
                 ft.Row(
@@ -998,6 +1012,7 @@ class QMKManager:
                     spacing=10,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
+                battery_panel,
                 self.sniff_status,
                 ft.Container(
                     content=self.sniff_log,
@@ -1635,6 +1650,174 @@ class QMKManager:
         self._capture_profile_payload(index, sample_data)
         name = self._profile_name_at(index) or f"Профиль {index + 1}"
         self._on_sniff_status(f"Payload сохранён в «{name}» (слот {index + 1}).")
+
+    # ---------- Battery test panel ----------
+    @staticmethod
+    def _parse_int(text, default=0, base=0):
+        try:
+            text = (text or "").strip()
+            if not text:
+                return default
+            if base == 0:
+                return int(text, 0)
+            return int(text, base)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _parse_float(text, default=1.0):
+        try:
+            return float((text or "").strip())
+        except Exception:
+            return default
+
+    @staticmethod
+    def _parse_optional_int(text):
+        text = (text or "").strip()
+        if not text or text.lower() == "none":
+            return None
+        try:
+            return int(text, 0)
+        except Exception:
+            return None
+
+    def _ensure_battery_test_fields(self):
+        if getattr(self, "bt_report_id", None) is not None:
+            return
+        self.bt_report_id = ft.TextField(label="report_id", width=110)
+        self.bt_response_length = ft.TextField(label="response_length", width=140)
+        self.bt_response_offset = ft.TextField(label="response_offset", width=140)
+        self.bt_response_scale = ft.TextField(label="response_scale", width=140)
+        self.bt_charging_offset = ft.TextField(label="charging_offset", width=140)
+        self.bt_charging_mask = ft.TextField(label="charging_mask (hex)", width=160)
+        self.bt_result = ft.Text(value="", size=12, selectable=True)
+
+    def _build_battery_test_panel(self):
+        self._ensure_battery_test_fields()
+        save_btn = ft.FilledTonalButton(text="Сохранить", on_click=self._battery_test_save)
+        test_btn = ft.FilledButton(text="Тест", on_click=self._battery_test_run)
+        inner = ft.Column(
+            [
+                ft.Row(
+                    [self.bt_report_id, self.bt_response_length, self.bt_response_offset],
+                    spacing=8, wrap=True,
+                ),
+                ft.Row(
+                    [self.bt_response_scale, self.bt_charging_offset, self.bt_charging_mask],
+                    spacing=8, wrap=True,
+                ),
+                ft.Row([save_btn, test_btn], spacing=8),
+                self.bt_result,
+            ],
+            spacing=8,
+            tight=True,
+        )
+        tile_cls = getattr(ft, "ExpansionTile", None)
+        if tile_cls is not None:
+            try:
+                return tile_cls(
+                    title=ft.Text("Battery test panel"),
+                    initially_expanded=False,
+                    controls=[ft.Container(content=inner, padding=12)],
+                )
+            except Exception:
+                pass
+        return ft.Container(
+            content=ft.Column(
+                [ft.Text("Battery test panel", weight=ft.FontWeight.W_600), inner],
+                spacing=8, tight=True,
+            ),
+            padding=12,
+            bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
+            border_radius=12,
+        )
+
+    def _battery_test_sync_from_active(self):
+        self._ensure_battery_test_fields()
+        entry = self._active_device()
+        batt = (entry or {}).get("battery") or {}
+        mapping = [
+            (self.bt_report_id, batt.get("report_id", 0), False),
+            (self.bt_response_length, batt.get("response_length", 65), False),
+            (self.bt_response_offset, batt.get("response_offset", 2), False),
+            (self.bt_response_scale, batt.get("response_scale", 1), False),
+            (self.bt_charging_offset,
+             "" if batt.get("charging_offset") is None else batt.get("charging_offset"), False),
+            (self.bt_charging_mask, hex(int(batt.get("charging_mask", 0) or 0)), True),
+        ]
+        for field_widget, value, is_hex in mapping:
+            if is_hex:
+                field_widget.value = value if isinstance(value, str) else hex(int(value or 0))
+            else:
+                field_widget.value = "" if value is None else str(value)
+            try:
+                field_widget.update()
+            except Exception:
+                pass
+
+    def _battery_test_build_config(self):
+        entry = self._active_device()
+        existing = (entry or {}).get("battery") or {}
+        return {
+            "query": list(existing.get("query") or []),
+            "report_id": self._parse_int(self.bt_report_id.value, 0),
+            "response_length": self._parse_int(self.bt_response_length.value, 32),
+            "response_offset": self._parse_int(self.bt_response_offset.value, 0),
+            "response_scale": self._parse_float(self.bt_response_scale.value, 1.0),
+            "charging_offset": self._parse_optional_int(self.bt_charging_offset.value),
+            "charging_mask": self._parse_int(self.bt_charging_mask.value, 0),
+        }
+
+    def _battery_test_save(self, e):
+        entry = self._active_device()
+        if entry is None:
+            self._snack("Нет активного устройства")
+            return
+        cfg = self._battery_test_build_config()
+        batt = entry.setdefault("battery", {})
+        # Preserve query as-is (we don't expose query editing here)
+        cfg["query"] = list(batt.get("query") or [])
+        batt.update(cfg)
+        self.save_config()
+        # Recreate / repoint battery monitor at the new dict
+        try:
+            self.battery_monitor = BatteryMonitor(
+                config_battery=self.config["battery"],
+                usb_lock=self.usb_lock,
+                get_device_path=self.get_keyboard_path_safe,
+            )
+        except Exception:
+            pass
+        self._snack("Battery конфиг сохранён")
+
+    def _battery_test_run(self, e):
+        entry = self._active_device()
+        if entry is None:
+            self.bt_result.value = "Нет активного устройства"
+            try:
+                self.bt_result.update()
+            except Exception:
+                pass
+            return
+        cfg = self._battery_test_build_config()
+        try:
+            monitor = BatteryMonitor(
+                config_battery=cfg,
+                usb_lock=self.usb_lock,
+                get_device_path=self.get_keyboard_path_safe,
+            )
+            monitor.read_once()
+            state = monitor.state
+            if state.percent is not None:
+                self.bt_result.value = f"→ percent={state.percent}, charging={state.charging}"
+            else:
+                self.bt_result.value = "→ ошибка (см. лог)"
+        except Exception as exc:
+            self.bt_result.value = f"→ ошибка: {exc}"
+        try:
+            self.bt_result.update()
+        except Exception:
+            pass
 
     def _save_battery_query_from_sniff(self, data, report_id):
         entry = self._active_device()
