@@ -881,8 +881,10 @@ class QMKManager:
             key = self._device_key_of(d)
             saved = self.config["devices"].get(key)
             label_prefix = (saved.get("label") or self._device_label_for(d)) if saved else self._device_label_for(d)
+            transport = (saved or {}).get("transport") or self._detect_transport(d)
+            badge = "[WIRED]" if transport == "wired" else "[WIRELESS]"
             label = (
-                f"{label_prefix} · VID {hex(d['vendor_id'])} · PID {hex(d['product_id'])} · Page {hex(d['usage_page'])}"
+                f"{badge} {label_prefix} · VID {hex(d['vendor_id'])} · PID {hex(d['product_id'])} · Page {hex(d['usage_page'])}"
             )
             options.append(ft.dropdown.Option(key=key, text=label))
         self.device_dropdown.options = options
