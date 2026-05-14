@@ -385,7 +385,7 @@ class QMKManager:
                 label=self._device_label_for(hid_dev),
             )
         entry = self.config["devices"][key]
-        if not entry.get("transport"):
+        if entry.get("transport") is None:
             entry["transport"] = self._detect_transport(hid_dev)
         self.save_config()
         return key
