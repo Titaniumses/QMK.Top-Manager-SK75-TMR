@@ -882,24 +882,16 @@ class QMKManager:
             options.append(ft.dropdown.Option(key=key, text=label))
         self.device_dropdown.options = options
 
-        # Choose selection: active_device if known, else first available.
-        # Profiles are static defaults — selecting any device is safe.
-        target_key = None
+        # Make sure every present device has a config entry (with transport
+        # auto-detected) BEFORE deciding which one wins.
+        for d in self.filtered_devices:
+            self._ensure_device_entry(d)
+        present_keys = [self._device_key_of(d) for d in self.filtered_devices]
         active_key = self.config.get("active_device")
-        if active_key and any(opt.key == active_key for opt in options):
-            target_key = active_key
-        elif options:
-            target_key = options[0].key
+        target_key = self._pick_active_target(active_key, present_keys, self.config["devices"])
         self.device_dropdown.value = target_key
         if target_key and target_key != active_key:
-            hid_dev = next(
-                (d for d in self.filtered_devices if self._device_key_of(d) == target_key),
-                None,
-            )
-            if hid_dev is not None and target_key not in self.config["devices"]:
-                self._ensure_device_entry(hid_dev)
-            if target_key in self.config["devices"]:
-                self._activate_device(target_key)
+            self._activate_device(target_key)
         self.page.update()
 
     def _on_device_dropdown_changed(self):
