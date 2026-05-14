@@ -1761,7 +1761,7 @@ class QMKManager:
         return {
             "query": list(existing.get("query") or []),
             "report_id": self._parse_int(self.bt_report_id.value, 0),
-            "response_length": self._parse_int(self.bt_response_length.value, 32),
+            "response_length": self._parse_int(self.bt_response_length.value, 65),
             "response_offset": self._parse_int(self.bt_response_offset.value, 0),
             "response_scale": self._parse_float(self.bt_response_scale.value, 1.0),
             "charging_offset": self._parse_optional_int(self.bt_charging_offset.value),
