@@ -588,7 +588,7 @@ class QMKManager:
         )
 
         self.transport_icon = ft.Icon(
-            name=ft.Icons.USB,
+            ft.Icons.USB,
             size=16,
             color=ft.Colors.ON_SURFACE_VARIANT,
             tooltip="Тип подключения активного устройства",
@@ -2072,12 +2072,12 @@ class QMKManager:
         entry = self._active_device()
         transport = entry.get("transport") if entry else None
         if transport == "wired":
-            icon.name = ft.Icons.USB
+            icon.icon = ft.Icons.USB
             icon.color = ft.Colors.BLUE_400
             icon.tooltip = "Проводное подключение"
             icon.visible = True
         elif transport == "wireless":
-            icon.name = ft.Icons.WIFI_TETHERING_ROUNDED
+            icon.icon = ft.Icons.WIFI_TETHERING_ROUNDED
             icon.color = ft.Colors.GREEN_400
             icon.tooltip = "Беспроводное подключение"
             icon.visible = True
