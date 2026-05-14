@@ -81,6 +81,10 @@ class QMKManager:
         self._battery_capture_attempts = 0
         self._battery_locked = False
         self._captured_profile_indices = set()
+        # Sniffer "learn mode": when ON, _on_sniff_event bypasses the strict
+        # pattern filter and logs every TX frame (and feature-report RX) with a
+        # classification tag. Per spec §4 — per-session, never persisted.
+        self._sniff_learn_mode = False
         self.detected_browser_path = _find_chrome()
 
         self._build_page()
@@ -796,6 +800,11 @@ class QMKManager:
             on_click=lambda e: self.copy_sniffer_log(),
             style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)),
         )
+        self.sniff_learn_switch = ft.Switch(
+            label="Learn mode (показать все TX)",
+            value=False,
+            on_change=self._toggle_learn_mode,
+        )
 
         self.browser_picker = ft.FilePicker()
         self.clipboard = ft.Clipboard()
@@ -981,6 +990,11 @@ class QMKManager:
                 ),
                 ft.Row(
                     [self.browser_pick_button, self.browser_path_text],
+                    spacing=10,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                ft.Row(
+                    [self.sniff_learn_switch],
                     spacing=10,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
@@ -1378,6 +1392,10 @@ class QMKManager:
         except Exception:
             upd()
 
+    def _toggle_learn_mode(self, e):
+        # Per spec §4: per-session, defaults off each app start, never persisted.
+        self._sniff_learn_mode = bool(e.control.value)
+
     def _on_sniff_event(self, ev: dict):
         self.sniff_events.append(ev)
         data = ev.get("data") or []
@@ -1396,6 +1414,18 @@ class QMKManager:
             and not is_profile
             and self._matches_battery_pattern(data, ev_type)
         )
+
+        # Learn mode: log EVERY TX frame with a classification tag, and
+        # bypass auto-save (user must click "Сохранить" explicitly).
+        if self._sniff_learn_mode:
+            if is_profile:
+                tag, color = "PROFILE?", ft.Colors.AMBER_400
+            elif ev_type == "feature":
+                tag, color = "BATTERY?", ft.Colors.LIGHT_BLUE_300
+            else:
+                tag, color = "TX", ft.Colors.GREY_500
+            self._render_sniff_row(tag, color, data, ev.get("reportId"), ev_type, ev)
+            return
 
         if not (is_profile or is_battery):
             return
@@ -1490,6 +1520,44 @@ class QMKManager:
             self._sniff_battery_chip = battery_chip_text
             threading.Thread(target=self._refresh_battery_for_sniff_chip, daemon=True).start()
 
+        # NOTE: Task 8 will plug action buttons (e.g. "Try as profile", "Try as
+        # battery") into the learn-mode row rendered by _render_sniff_row above.
+        line = ft.Row(
+            controls,
+            spacing=8,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        def upd():
+            self.sniff_log.controls.append(line)
+            if len(self.sniff_log.controls) > 500:
+                self.sniff_log.controls = self.sniff_log.controls[-500:]
+            self.page.update()
+        try:
+            self.page.run_thread(upd)
+        except Exception:
+            upd()
+
+    def _render_sniff_row(self, tag, color, data, report_id, ev_type, payload):
+        """Render a single sniffer log row (learn mode).
+
+        Task 8 will extend this with per-row action buttons ("Try as profile",
+        "Try as battery") — keep the signature stable so that lands cleanly.
+        """
+        hex_str = ", ".join(f"0x{b:02x}" for b in data[:64])
+        if len(data) > 64:
+            hex_str += f", … (+{len(data) - 64})"
+        idx = len(self.sniff_events)
+        controls = [
+            ft.Text(f"#{idx}", size=11, color=ft.Colors.ON_SURFACE_VARIANT, width=40),
+            ft.Container(
+                content=ft.Text(tag, size=10, weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK),
+                bgcolor=color, padding=ft.Padding.symmetric(horizontal=6, vertical=2),
+                border_radius=6,
+            ),
+            ft.Text(f"{ev_type} id={report_id}", size=11, color=ft.Colors.ON_SURFACE_VARIANT, width=110),
+            ft.Text(hex_str, size=11, selectable=True, font_family="Consolas", expand=True),
+        ]
+        # Task 8: append per-row action buttons here.
         line = ft.Row(
             controls,
             spacing=8,
