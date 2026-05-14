@@ -377,17 +377,22 @@ class QMKManager:
 
     def _ensure_device_entry(self, hid_dev):
         """Create an empty config entry for an HID device if missing. Returns key.
-        Also lazily fills the `transport` field from device metadata."""
+        Also lazily fills the `transport` field from device metadata.
+        Saves config only when something actually changed."""
         key = self._device_key_of(hid_dev)
+        dirty = False
         if key not in self.config["devices"]:
             self.config["devices"][key] = self._empty_device_entry(
                 hid_dev["vendor_id"], hid_dev["product_id"], hid_dev["usage_page"],
                 label=self._device_label_for(hid_dev),
             )
+            dirty = True
         entry = self.config["devices"][key]
         if entry.get("transport") is None:
             entry["transport"] = self._detect_transport(hid_dev)
-        self.save_config()
+            dirty = True
+        if dirty:
+            self.save_config()
         return key
 
     # ---------- Profile helpers ----------
