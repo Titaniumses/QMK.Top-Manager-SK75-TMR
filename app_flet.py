@@ -974,7 +974,7 @@ class QMKManager:
                 spacing=4,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             )
-            options.append(ft.dropdown.Option(key=key, content=row))
+            options.append(ft.dropdown.Option(key=key, text=label_text, content=row))
         self.device_dropdown.options = options
 
         # Make sure every present device has a config entry (with transport
