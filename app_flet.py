@@ -661,7 +661,7 @@ class QMKManager:
                 ft.Segment(value="wireless", label=ft.Text("Wireless"),
                            icon=ft.Icon(ft.Icons.WIFI_TETHERING_ROUNDED)),
             ],
-            selected={"wired"},
+            selected=["wired"],
             allow_multiple_selection=False,
             allow_empty_selection=False,
             on_change=self._on_transport_override_change,
@@ -1579,20 +1579,20 @@ class QMKManager:
                     [ft.Text("В слот"), ft.Icon(ft.Icons.ARROW_DROP_DOWN, size=16)],
                     spacing=2,
                 ),
-                padding=ft.padding.symmetric(horizontal=8, vertical=4),
-                border=ft.border.all(1, ft.Colors.OUTLINE),
+                padding=ft.Padding.symmetric(horizontal=8, vertical=4),
+                border=ft.Border.all(1, ft.Colors.OUTLINE),
                 border_radius=4,
             ),
             items=[
                 ft.PopupMenuItem(
-                    text=f"Профиль {i + 1}",
+                    content=f"Профиль {i + 1}",
                     on_click=lambda e, idx=i, d=list(data): self._save_profile_payload_from_sniff(idx, d),
                 )
                 for i in range(4)
             ],
         )
         batt_btn = ft.OutlinedButton(
-            text="Как battery query",
+            "Как battery query",
             on_click=lambda e, d=list(data), rid=report_id: self._save_battery_query_from_sniff(d, rid),
         )
         controls.append(slot_btn)
@@ -1694,8 +1694,8 @@ class QMKManager:
 
     def _build_battery_test_panel(self):
         self._ensure_battery_test_fields()
-        save_btn = ft.FilledTonalButton(text="Сохранить", on_click=self._battery_test_save)
-        test_btn = ft.FilledButton(text="Тест", on_click=self._battery_test_run)
+        save_btn = ft.FilledTonalButton("Сохранить", on_click=self._battery_test_save)
+        test_btn = ft.FilledButton("Тест", on_click=self._battery_test_run)
         inner = ft.Column(
             [
                 ft.Row(
@@ -1717,7 +1717,7 @@ class QMKManager:
             try:
                 return tile_cls(
                     title=ft.Text("Battery test panel"),
-                    initially_expanded=False,
+                    expanded=False,
                     controls=[ft.Container(content=inner, padding=12)],
                 )
             except Exception:
@@ -2116,9 +2116,9 @@ class QMKManager:
         entry = self._active_device()
         transport = entry.get("transport") if entry else None
         if transport in ("wired", "wireless"):
-            btn.selected = {transport}
+            btn.selected = [transport]
         else:
-            btn.selected = {"wireless"}
+            btn.selected = ["wireless"]
         try:
             btn.update()
         except Exception:
