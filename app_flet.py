@@ -81,6 +81,11 @@ class QMKManager:
         self._battery_capture_attempts = 0
         self._battery_locked = False
         self._captured_profile_indices = set()
+        # Кэш «рабочего» HID-интерфейса по ключу VID:PID:usage_page.
+        # Многие клавиатуры (и в проводе, и в 2.4G) выставляют несколько
+        # путей под одним usage_page; пишем во ВСЕ — а потом запоминаем тот,
+        # что отвечает на feature-write успехом, чтобы дальше не перебирать.
+        self._working_hid_path = {}
         # Sniffer "learn mode": when ON, _on_sniff_event bypasses the strict
         # pattern filter and logs every TX frame (and feature-report RX) with a
         # classification tag. Per spec §4 — per-session, never persisted.
@@ -2003,13 +2008,33 @@ class QMKManager:
 
     # ---------- HID ----------
     def get_keyboard_path(self):
-        vid = self.config["device"]["vid"]
-        pid = self.config["device"]["pid"]
-        usage_page = self.config["device"]["usage_page"]
+        """Возвращает первый path активного устройства (для совместимости —
+        BatteryMonitor использует именно эту сигнатуру). Предпочитает кэшированный
+        рабочий path, если он всё ещё перечисляется."""
+        paths = self.get_keyboard_paths()
+        return paths[0] if paths else None
+
+    def get_keyboard_paths(self):
+        """Все HID-пути активного устройства с подходящим usage_page.
+        Кэшированный «рабочий» path выносится в начало списка."""
+        dev = self.config.get("device")
+        if not dev:
+            return []
+        vid = dev["vid"]
+        pid = dev["pid"]
+        usage_page = dev["usage_page"]
+        paths = []
         for d in hid.enumerate(vid, pid):
             if d['usage_page'] == usage_page:
-                return d['path']
-        return None
+                paths.append(d['path'])
+        cache_key = self._device_key(vid, pid, usage_page)
+        cached = self._working_hid_path.get(cache_key)
+        if cached and cached in paths:
+            paths.remove(cached)
+            paths.insert(0, cached)
+        elif cached:
+            self._working_hid_path.pop(cache_key, None)
+        return paths
 
     def get_keyboard_path_safe(self):
         """Like get_keyboard_path but returns None if device isn't configured."""
@@ -2148,28 +2173,50 @@ class QMKManager:
 
     def apply_payload(self, profile_name, payload_data, manual=False):
         with self.usb_lock:
-            path = self.get_keyboard_path()
-            if not path:
+            paths = self.get_keyboard_paths()
+            if not paths:
                 print("[Ошибка] Устройство USB не найдено для отправки.")
                 return
+            dev = self.config.get("device") or {}
+            cache_key = self._device_key(dev.get("vid", 0), dev.get("pid", 0), dev.get("usage_page", 0))
+            sent_path = None
+            last_err = None
+            for path in paths:
+                try:
+                    device = hid.device()
+                    device.open_path(path)
+                    device.set_nonblocking(1)
+                    rc = device.send_feature_report([0x00] + payload_data)
+                    device.close()
+                except Exception as e:
+                    last_err = e
+                    try:
+                        device.close()
+                    except Exception:
+                        pass
+                    continue
+                # hid.device.send_feature_report возвращает число записанных байт
+                # (>0 на успехе, -1 при ошибке). Часть драйверов в проводе на «глухом»
+                # интерфейсе тоже отдаёт 0/положительное — поэтому если активных
+                # путей несколько, шлём во все, но фиксируем первый, который не упал.
+                if rc is None or rc > 0:
+                    sent_path = sent_path or path
+            if sent_path is None:
+                print(f"[Ошибка USB] Не удалось отправить HID пакет ни в один интерфейс: {last_err}")
+                return
+            self._working_hid_path[cache_key] = sent_path
             try:
-                device = hid.device()
-                device.open_path(path)
-                device.set_nonblocking(1)
-                device.send_feature_report([0x00] + payload_data)
-                device.close()
-
                 if manual:
                     try:
                         hwnd = win32gui.GetForegroundWindow()
-                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                        self.last_active_window = psutil.Process(pid).name().lower()
+                        _, pid_ = win32process.GetWindowThreadProcessId(hwnd)
+                        self.last_active_window = psutil.Process(pid_).name().lower()
                     except Exception:
                         pass
 
                 self.current_binding = profile_name
                 trigger = "Hotkey" if manual else "Авто"
-                print(f"[{trigger}] Успешно применен профиль: {profile_name}")
+                print(f"[{trigger}] Успешно применен профиль: {profile_name} (path={sent_path!r})")
 
                 try:
                     Notification(
@@ -2181,7 +2228,7 @@ class QMKManager:
                 except Exception as e:
                     print(f"[Уведомление] Ошибка: {e}")
             except Exception as e:
-                print(f"[Ошибка USB] Не удалось отправить HID пакет: {e}")
+                print(f"[Ошибка] Пост-обработка применения профиля: {e}")
 
     def background_task(self):
         print("[DEBUG] Фоновый сканер окон запущен...")
