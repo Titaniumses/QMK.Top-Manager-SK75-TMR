@@ -373,6 +373,10 @@ class QMKManager:
                 self.worker_thread = threading.Thread(target=self.background_task, daemon=True)
                 self.worker_thread.start()
         threading.Thread(target=self._manual_battery_refresh, daemon=True).start()
+        try:
+            self._update_transport_icon()
+        except Exception:
+            pass
         return True
 
     def _ensure_device_entry(self, hid_dev):
@@ -564,6 +568,14 @@ class QMKManager:
             tooltip="Уровень заряда клавиатуры",
         )
 
+        self.transport_icon = ft.Icon(
+            name=ft.Icons.USB,
+            size=16,
+            color=ft.Colors.ON_SURFACE_VARIANT,
+            tooltip="Тип подключения активного устройства",
+            visible=False,
+        )
+
         header = ft.Container(
             content=ft.Row(
                 [
@@ -588,7 +600,7 @@ class QMKManager:
                         ],
                         spacing=12,
                     ),
-                    ft.Row([self.battery_chip, self.status_badge], spacing=8),
+                    ft.Row([self.transport_icon, self.battery_chip, self.status_badge], spacing=8),
                 ],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             ),
@@ -899,6 +911,10 @@ class QMKManager:
         self.device_dropdown.value = target_key
         if target_key and target_key != active_key:
             self._activate_device(target_key)
+        try:
+            self._update_transport_icon()
+        except Exception:
+            pass
         self.page.update()
 
     def _on_device_dropdown_changed(self):
@@ -1721,6 +1737,30 @@ class QMKManager:
         if self.tray:
             self.tray.update_battery(state)
         self.publish_battery_to_ui(state)
+
+    def _update_transport_icon(self):
+        """Sync header transport icon with active device's transport field."""
+        icon = getattr(self, "transport_icon", None)
+        if icon is None:
+            return
+        entry = self._active_device()
+        transport = entry.get("transport") if entry else None
+        if transport == "wired":
+            icon.name = ft.Icons.USB
+            icon.color = ft.Colors.BLUE_400
+            icon.tooltip = "Проводное подключение"
+            icon.visible = True
+        elif transport == "wireless":
+            icon.name = ft.Icons.WIFI_TETHERING_ROUNDED
+            icon.color = ft.Colors.GREEN_400
+            icon.tooltip = "Беспроводное подключение"
+            icon.visible = True
+        else:
+            icon.visible = False
+        try:
+            icon.update()
+        except Exception:
+            pass
 
     def _refresh_battery_for_sniff_chip(self):
         self._manual_battery_refresh()
