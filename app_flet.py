@@ -922,7 +922,11 @@ class QMKManager:
         seen = set()
         deduped = []
         for d in custom_devices:
-            key = (d['vendor_id'], d['product_id'], d['usage_page'], d.get('usage', 0))
+            # Дедуп по тому же ключу, что использует _device_key_of (VID:PID:usage_page).
+            # Раньше ключ включал ещё `usage`, и устройства с одинаковым usage_page,
+            # но разными usage (часто 0x00 + 0x01 на одной клавиатуре) попадали как
+            # два отдельных пункта дропдауна с ОДИНАКОВЫМ key — выглядели дубликатами.
+            key = (d['vendor_id'], d['product_id'], d['usage_page'])
             if key in seen:
                 continue
             seen.add(key)
