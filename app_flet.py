@@ -904,9 +904,17 @@ class QMKManager:
         )
 
     # ---------- Devices ----------
+    # VID/usage_page всех клавиатур, настраиваемых через qmk.top.
+    # PID отличается у разных моделей, VID и Page — общие.
+    QMK_TOP_VID = 0x3151
+    QMK_TOP_USAGE_PAGE = 0xFFFF
+
     def refresh_devices(self):
         self.devices = hid.enumerate()
-        custom_devices = [d for d in self.devices if d['usage_page'] >= 0xFF00]
+        custom_devices = [
+            d for d in self.devices
+            if d['vendor_id'] == self.QMK_TOP_VID and d['usage_page'] == self.QMK_TOP_USAGE_PAGE
+        ]
         seen = set()
         deduped = []
         for d in custom_devices:
