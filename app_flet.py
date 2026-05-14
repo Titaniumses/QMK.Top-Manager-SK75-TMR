@@ -1557,7 +1557,31 @@ class QMKManager:
             ft.Text(f"{ev_type} id={report_id}", size=11, color=ft.Colors.ON_SURFACE_VARIANT, width=110),
             ft.Text(hex_str, size=11, selectable=True, font_family="Consolas", expand=True),
         ]
-        # Task 8: append per-row action buttons here.
+        # Task 8: per-row action buttons (learn-mode only path).
+        slot_btn = ft.PopupMenuButton(
+            content=ft.Container(
+                content=ft.Row(
+                    [ft.Text("В слот"), ft.Icon(ft.Icons.ARROW_DROP_DOWN, size=16)],
+                    spacing=2,
+                ),
+                padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                border=ft.border.all(1, ft.Colors.OUTLINE),
+                border_radius=4,
+            ),
+            items=[
+                ft.PopupMenuItem(
+                    text=f"Профиль {i + 1}",
+                    on_click=lambda e, idx=i, d=list(data): self._save_profile_payload_from_sniff(idx, d),
+                )
+                for i in range(4)
+            ],
+        )
+        batt_btn = ft.OutlinedButton(
+            text="Как battery query",
+            on_click=lambda e, d=list(data), rid=report_id: self._save_battery_query_from_sniff(d, rid),
+        )
+        controls.append(slot_btn)
+        controls.append(batt_btn)
         line = ft.Row(
             controls,
             spacing=8,
@@ -1611,6 +1635,36 @@ class QMKManager:
         self._capture_profile_payload(index, sample_data)
         name = self._profile_name_at(index) or f"Профиль {index + 1}"
         self._on_sniff_status(f"Payload сохранён в «{name}» (слот {index + 1}).")
+
+    def _save_battery_query_from_sniff(self, data, report_id):
+        entry = self._active_device()
+        if entry is None:
+            self._snack("Нет активного устройства")
+            return
+        batt = entry.get("battery")
+        if not isinstance(batt, dict):
+            batt = {
+                "query": [],
+                "report_id": 0,
+                "response_length": 65,
+                "response_offset": 2,
+                "response_scale": 1,
+                "charging_offset": None,
+                "charging_mask": 0,
+            }
+            entry["battery"] = batt
+        batt["query"] = list(data)
+        try:
+            batt["report_id"] = int(report_id) if report_id is not None else 0
+        except (TypeError, ValueError):
+            batt["report_id"] = 0
+        self.save_config()
+        if getattr(self, "battery_monitor", None) is not None:
+            try:
+                threading.Thread(target=self._manual_battery_refresh, daemon=True).start()
+            except Exception:
+                pass
+        self._snack("Battery query сохранён")
 
     def _capture_profile_payload(self, index: int, sample_data: list):
         """Save the actually-observed payload for the specific slot only.
