@@ -997,11 +997,17 @@ class QMKManager:
         # Если устройство возвращает осмысленный процент заряда — это wireless.
         # Если нет — wired (проводной режим заряд не отдаёт). Транспорт пишем
         # в config и в дропдауне оставляем только устройства соответствующего типа.
+        # Устройства с `transport_locked=True` (ручной выбор пользователем)
+        # пробу игнорируют и из списка не отфильтровываются.
         probe_results = {}
         any_wireless = False
         for d in self.filtered_devices:
-            pct = self._probe_battery_percent(d)
             key = self._device_key_of(d)
+            entry = self.config["devices"].get(key) or {}
+            if entry.get("transport_locked"):
+                probe_results[key] = None
+                continue
+            pct = self._probe_battery_percent(d)
             probe_results[key] = pct
             if pct is not None:
                 any_wireless = True
@@ -1011,6 +1017,8 @@ class QMKManager:
             key = self._device_key_of(d)
             entry = self.config["devices"].get(key)
             if entry is None:
+                continue
+            if entry.get("transport_locked"):
                 continue
             new_transport = "wireless" if probe_results[key] is not None else "wired"
             if entry.get("transport") != new_transport:
@@ -1022,7 +1030,10 @@ class QMKManager:
         target_transport = "wireless" if any_wireless else "wired"
         self.filtered_devices = [
             d for d in self.filtered_devices
-            if (self.config["devices"].get(self._device_key_of(d)) or {}).get("transport") == target_transport
+            if (
+                (self.config["devices"].get(self._device_key_of(d)) or {}).get("transport") == target_transport
+                or (self.config["devices"].get(self._device_key_of(d)) or {}).get("transport_locked")
+            )
         ]
         custom_devices = self.filtered_devices
 
@@ -2259,6 +2270,7 @@ class QMKManager:
             self.config["devices"][key] = entry
             self._normalize_device_entry(entry)
         entry["transport"] = transport
+        entry["transport_locked"] = True
         self.save_config()
         self.refresh_devices()
         try:
