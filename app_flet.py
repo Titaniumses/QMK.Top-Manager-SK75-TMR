@@ -1,7 +1,9 @@
 import flet as ft
 import hid
 import json
+import logging
 import os
+import queue
 import sys
 import threading
 import time
@@ -15,8 +17,28 @@ from battery import BatteryMonitor, BatteryState
 from tray import TrayIcon, set_icon_source
 from sniffer import HIDSniffer, _find_chrome, is_chromium_executable
 
+logger = logging.getLogger(__name__)
+
 CONFIG_FILE = "profiles_config.json"
 PROFILE_COUNT = 4
+
+
+def _setup_logging(debug: bool) -> None:
+    root = logging.getLogger()
+    root.handlers.clear()
+    if debug:
+        handler = logging.FileHandler("debug.log", mode="w", encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "[%(asctime)s.%(msecs)03d] [%(levelname)s] [%(name)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        root.setLevel(logging.DEBUG)
+        root.addHandler(handler)
+        for noisy in ("flet", "flet_core", "flet_runtime", "flet_controls",
+                       "flet_transport", "flet_desktop", "PIL", "PIL.Image"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+    else:
+        root.setLevel(logging.WARNING)
 
 
 def _default_profile_payload(idx: int) -> list:
@@ -43,6 +65,8 @@ class QMKManager:
     def __init__(self, page: ft.Page):
         self.page = page
         self.config = self.load_config()
+        _setup_logging(self.config.get("settings", {}).get("debug", False))
+        logger.info("app started, config loaded")
         self._ensure_active_device_aliases()
         self.is_running = False
         self.worker_thread = None
@@ -65,6 +89,8 @@ class QMKManager:
             config_battery=self.config["battery"],
             usb_lock=self.usb_lock,
             get_device_path=self.get_keyboard_path_safe,
+            get_device_paths=self.get_keyboard_paths,
+            on_working_path=self._cache_working_path,
         )
         self.battery_thread = None
         self.current_binding = None
@@ -90,6 +116,9 @@ class QMKManager:
         # pattern filter and logs every TX frame (and feature-report RX) with a
         # classification tag. Per spec §4 — per-session, never persisted.
         self._sniff_learn_mode = False
+        self._battery_probe_queue = queue.Queue()
+        self._battery_probe_thread = None
+        self._battery_probe_stop = threading.Event()
         self.bt_report_id = None
         self.bt_response_length = None
         self.bt_response_offset = None
@@ -312,12 +341,14 @@ class QMKManager:
         entry["battery"] = battery
 
     def load_config(self):
+        logger.debug("loading config from %s", CONFIG_FILE)
         default_config = {
             "mode": "auto",
             "settings": {
                 "start_minimized": False,
                 "autostart_service": True,
                 "browser_path": "",
+                "debug": False,
             },
             "devices": {},
             "active_device": None,
@@ -427,6 +458,8 @@ class QMKManager:
                 config_battery=self.config["battery"],
                 usb_lock=self.usb_lock,
                 get_device_path=self.get_keyboard_path_safe,
+                get_device_paths=self.get_keyboard_paths,
+                on_working_path=self._cache_working_path,
             )
         except Exception:
             pass
@@ -519,6 +552,7 @@ class QMKManager:
         return self.mode_segmented.selected[0] if self.mode_segmented.selected else "auto"
 
     def save_config(self):
+        logger.debug("saving config to %s", CONFIG_FILE)
         try:
             self.config["mode"] = self._current_mode()
         except Exception:
@@ -739,7 +773,7 @@ class QMKManager:
         device_card = self._card(
             icon=ft.Icons.USB_ROUNDED,
             title="Устройство",
-            subtitle="Выберите QMK-клавиатуру из списка HID-устройств.",
+            subtitle="Выберите QMK-клавиатуру из списка.",
             content=ft.Container(
                 ft.Column(
                     [
@@ -756,7 +790,7 @@ class QMKManager:
         profiles_card = self._card(
             icon=ft.Icons.LAYERS_ROUNDED,
             title="Профили",
-            subtitle="Всегда 4 фиксированных профиля. Имя и хоткей — редактируемые, payload подгружается снифером.",
+            subtitle="Всегда 4 фиксированных профиля. Имя и хоткей — редактируемые.",
             content=ft.Container(
                 content=self.payloads_column,
                 margin=ft.Margin.only(top=12),
@@ -841,8 +875,10 @@ class QMKManager:
         )
 
         self.sniff_log = ft.ListView(
-            spacing=2, padding=8, auto_scroll=True,
+            spacing=6, padding=8, auto_scroll=False,
+            on_scroll=self._on_sniff_scroll,
         )
+        self._sniff_auto_scroll = True
         self.sniff_status = ft.Text("Сниффер остановлен.", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
         self.sniff_button = ft.FilledTonalButton(
             "Запустить sniff",
@@ -1120,14 +1156,7 @@ class QMKManager:
         self.page.update()
 
     def open_sniffer_modal(self):
-        try:
-            ww = int(self.page.window.width or 1100)
-            wh = int(self.page.window.height or 740)
-        except Exception:
-            ww, wh = 1100, 740
-        content_w = max(720, ww - 80)
-        content_h = max(480, wh - 200)
-        log_h = max(280, content_h - 180)
+        self._sniff_auto_scroll = True
 
         def on_close(e):
             try:
@@ -1138,10 +1167,18 @@ class QMKManager:
         battery_panel = self._build_battery_test_panel()
         self._battery_test_sync_from_active()
 
+        self._sniff_scroll_btn = ft.IconButton(
+            icon=ft.Icons.ARROW_DOWNWARD_ROUNDED,
+            tooltip="Прокрутить вниз (авто-скролл)",
+            icon_color=ft.Colors.PRIMARY,
+            on_click=self._sniff_scroll_to_bottom,
+        )
+
         body = ft.Column(
             [
                 ft.Row(
-                    [self.sniff_button, self.sniff_clear_button, self.sniff_copy_button],
+                    [self.sniff_button, self.sniff_clear_button, self.sniff_copy_button,
+                     self._sniff_scroll_btn],
                     spacing=8, wrap=True,
                 ),
                 ft.Row(
@@ -1161,11 +1198,11 @@ class QMKManager:
                     bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
                     border_radius=12,
                     padding=4,
-                    height=log_h,
+                    expand=True,
                 ),
             ],
             spacing=10,
-            tight=True,
+            expand=True,
         )
 
         dlg = ft.AlertDialog(
@@ -1173,7 +1210,7 @@ class QMKManager:
             title=ft.Text("HID Sniffer — qmk.top"),
             content=ft.Container(
                 content=body,
-                width=content_w,
+                expand=True,
             ),
             actions=[
                 ft.TextButton("Закрыть", on_click=on_close),
@@ -1550,8 +1587,85 @@ class QMKManager:
             upd()
 
     def _toggle_learn_mode(self, e):
-        # Per spec §4: per-session, defaults off each app start, never persisted.
         self._sniff_learn_mode = bool(e.control.value)
+        logger.debug("learn_mode toggled: %s", self._sniff_learn_mode)
+        if self._sniff_learn_mode:
+            self._start_battery_probe_worker()
+        else:
+            self._stop_battery_probe_worker()
+
+    def _sniff_scroll_to_bottom(self, e=None):
+        self._sniff_auto_scroll = True
+        try:
+            self.sniff_log.scroll_to(offset=-1, duration=100)
+            self.page.update()
+        except Exception:
+            pass
+
+    def _on_sniff_scroll(self, e: ft.OnScrollEvent):
+        if e.event_type == "user":
+            self._sniff_auto_scroll = False
+
+    def _start_battery_probe_worker(self):
+        entry = self._active_device()
+        batt = entry.get("battery") if entry else None
+        if not batt or not batt.get("response_offset"):
+            logger.debug("battery probe worker not started: no battery config")
+            return
+        self._battery_probe_stop.clear()
+        while not self._battery_probe_queue.empty():
+            try:
+                self._battery_probe_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._battery_probe_thread = threading.Thread(
+            target=self._battery_probe_worker, daemon=True)
+        self._battery_probe_thread.start()
+        logger.debug("battery probe worker started")
+
+    def _stop_battery_probe_worker(self):
+        self._battery_probe_stop.set()
+        while not self._battery_probe_queue.empty():
+            try:
+                self._battery_probe_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._battery_probe_thread = None
+        logger.debug("battery probe worker stopped")
+
+    def _battery_probe_worker(self):
+        logger.debug("battery probe worker thread running")
+        while not self._battery_probe_stop.is_set():
+            try:
+                item = self._battery_probe_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            packet_data, result_text = item
+            path = self.get_keyboard_path_safe()
+            if path is None:
+                logger.debug("battery probe: no device path")
+                continue
+            time.sleep(0.2)
+            if self._battery_probe_stop.is_set():
+                break
+            percent = self.battery_monitor.probe_battery(packet_data, path)
+            if percent is not None:
+                txt = f"🔋 {percent}%"
+                color = ft.Colors.GREEN_400
+            else:
+                txt = "—"
+                color = ft.Colors.GREY_500
+            logger.debug("battery probe result: packet=%s → %s",
+                         [f"0x{b:02x}" for b in packet_data[:4]], txt)
+            def upd(t=txt, c=color, rt=result_text):
+                try:
+                    rt.value = t
+                    rt.color = c
+                    self.page.update()
+                except Exception:
+                    pass
+            self._ui_call(upd)
+        logger.debug("battery probe worker thread exiting")
 
     def _on_sniff_event(self, ev: dict):
         self.sniff_events.append(ev)
@@ -1561,11 +1675,16 @@ class QMKManager:
         direction = (ev.get("dir") or "").upper()
         if direction != "TX":
             return
+        logger.debug("sniff TX event type=%s reportId=%s data=%s",
+                      ev.get("type"), ev.get("reportId"),
+                      [f"0x{b:02x}" for b in data[:8]])
 
         is_profile = self._matches_profile_pattern(data)
-        # Battery candidate must be a TX *feature* report (sendFeatureReport),
-        # not an output report — and not the profile opcode.
         ev_type = (ev.get("type") or "").lower()
+        if is_profile:
+            logger.debug("sniff: PROFILE detected reportId=%s ev_type=%s full_data=%s",
+                          ev.get("reportId"), ev_type,
+                          [f"0x{b:02x}" for b in data])
         is_battery = (
             ev_type == "feature"
             and not is_profile
@@ -1679,15 +1798,23 @@ class QMKManager:
 
         # NOTE: Task 8 will plug action buttons (e.g. "Try as profile", "Try as
         # battery") into the learn-mode row rendered by _render_sniff_row above.
-        line = ft.Row(
-            controls,
-            spacing=8,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        line = ft.Container(
+            content=ft.Row(
+                controls,
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+            border_radius=10,
+            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
+            border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
         )
         def upd():
             self.sniff_log.controls.append(line)
             if len(self.sniff_log.controls) > 500:
                 self.sniff_log.controls = self.sniff_log.controls[-500:]
+            if self._sniff_auto_scroll:
+                self.sniff_log.scroll_to(offset=-1, duration=100)
             self.page.update()
         try:
             self.page.run_thread(upd)
@@ -1695,15 +1822,12 @@ class QMKManager:
             upd()
 
     def _render_sniff_row(self, tag, color, data, report_id, ev_type, payload):
-        """Render a single sniffer log row (learn mode).
-
-        Task 8 will extend this with per-row action buttons ("Try as profile",
-        "Try as battery") — keep the signature stable so that lands cleanly.
-        """
+        """Render a single sniffer log row (learn mode) with auto battery probe."""
         hex_str = ", ".join(f"0x{b:02x}" for b in data[:64])
         if len(data) > 64:
             hex_str += f", … (+{len(data) - 64})"
         idx = len(self.sniff_events)
+        battery_result_text = ft.Text("", size=11, weight=ft.FontWeight.W_600, width=80)
         controls = [
             ft.Text(f"#{idx}", size=11, color=ft.Colors.ON_SURFACE_VARIANT, width=40),
             ft.Container(
@@ -1713,8 +1837,8 @@ class QMKManager:
             ),
             ft.Text(f"{ev_type} id={report_id}", size=11, color=ft.Colors.ON_SURFACE_VARIANT, width=110),
             ft.Text(hex_str, size=11, selectable=True, font_family="Consolas", expand=True),
+            battery_result_text,
         ]
-        # Task 8: per-row action buttons (learn-mode only path).
         slot_btn = ft.PopupMenuButton(
             content=ft.Container(
                 content=ft.Row(
@@ -1739,35 +1863,46 @@ class QMKManager:
         )
         controls.append(slot_btn)
         controls.append(batt_btn)
-        line = ft.Row(
-            controls,
-            spacing=8,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        line = ft.Container(
+            content=ft.Row(
+                controls,
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+            border_radius=10,
+            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
+            border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
         )
         def upd():
             self.sniff_log.controls.append(line)
             if len(self.sniff_log.controls) > 500:
                 self.sniff_log.controls = self.sniff_log.controls[-500:]
+            if self._sniff_auto_scroll:
+                self.sniff_log.scroll_to(offset=-1, duration=100)
             self.page.update()
         try:
             self.page.run_thread(upd)
         except Exception:
             upd()
+        if (self._sniff_learn_mode
+                and ev_type == "feature"
+                and self._battery_probe_thread is not None
+                and not self._battery_probe_stop.is_set()):
+            self._battery_probe_queue.put((list(data), battery_result_text))
 
     @staticmethod
     def _matches_profile_pattern(data: list) -> bool:
-        # qmk.top profile-switch frame (verified static):
-        # [0x04, idx, 0,0,0,0,0, 0xFB-idx, 0×56] (64 bytes)
-        # idx 0 → 0xFB, 1 → 0xFA, 2 → 0xF9, 3 → 0xF8.
         if len(data) < 8:
             return False
-        if data[0] != 0x04:
+        if data[0] not in (0x04, 0x05):
             return False
         if data[1] not in (0, 1, 2, 3):
             return False
         if any(b != 0 for b in data[2:7]):
             return False
-        if data[7] != (0xFB - data[1]) & 0xFF:
+        expected_check = ((0xFB - data[1]) & 0xFF) if data[0] == 0x04 else ((0xFA - data[1]) & 0xFF)
+        if data[7] != expected_check:
             return False
         if any(b != 0 for b in data[8:]):
             return False
@@ -1927,6 +2062,8 @@ class QMKManager:
                 config_battery=self.config["battery"],
                 usb_lock=self.usb_lock,
                 get_device_path=self.get_keyboard_path_safe,
+                get_device_paths=self.get_keyboard_paths,
+                on_working_path=self._cache_working_path,
             )
         except Exception:
             pass
@@ -1947,6 +2084,8 @@ class QMKManager:
                 config_battery=cfg,
                 usb_lock=self.usb_lock,
                 get_device_path=self.get_keyboard_path_safe,
+                get_device_paths=self.get_keyboard_paths,
+                on_working_path=self._cache_working_path,
             )
             monitor.read_once()
             state = monitor.state
@@ -2179,12 +2318,22 @@ class QMKManager:
             return None
         return self.get_keyboard_path()
 
+    def _cache_working_path(self, path):
+        """Called by BatteryMonitor when it finds a working HID path."""
+        dev = self.config.get("device") or {}
+        cache_key = self._device_key(dev.get("vid", 0), dev.get("pid", 0), dev.get("usage_page", 0))
+        self._working_hid_path[cache_key] = path
+        logger.debug("cached working HID path from battery: %s", path)
+
     def battery_poll_loop(self):
+        logger.info("battery poll loop started (60s interval)")
         print("[Battery] Поток опроса батареи запущен (каждые 60 сек).")
         while self.app_alive:
             try:
                 self.battery_monitor.read_once()
                 state = self.battery_monitor.state
+                logger.debug("battery poll: percent=%s charging=%s stale=%s",
+                             state.percent, state.charging, state.is_stale)
                 if self.tray:
                     self.tray.update_battery(state)
                 self.publish_battery_to_ui(state)
@@ -2307,11 +2456,18 @@ class QMKManager:
             upd()
 
     def apply_payload(self, profile_name, payload_data, manual=False):
+        full_report = [0x00] + payload_data
+        logger.debug("apply_payload profile=%s manual=%s report_id=0x00 "
+                      "full_report[:%d]=%s payload_len=%d",
+                      profile_name, manual, min(len(full_report), 16),
+                      [f"0x{b:02x}" for b in full_report[:16]], len(payload_data))
         with self.usb_lock:
             paths = self.get_keyboard_paths()
             if not paths:
+                logger.warning("apply_payload: no HID paths found for device")
                 print("[Ошибка] Устройство USB не найдено для отправки.")
                 return
+            logger.debug("apply_payload: %d HID path(s) to try", len(paths))
             dev = self.config.get("device") or {}
             cache_key = self._device_key(dev.get("vid", 0), dev.get("pid", 0), dev.get("usage_page", 0))
             sent_path = None
@@ -2321,7 +2477,16 @@ class QMKManager:
                     device = hid.device()
                     device.open_path(path)
                     device.set_nonblocking(1)
-                    rc = device.send_feature_report([0x00] + payload_data)
+                    rc = device.send_feature_report(full_report)
+                    logger.debug("apply_payload send_feature_report path=%s rc=%s", path, rc)
+                    read_back = None
+                    if rc is not None and rc > 0:
+                        try:
+                            read_back = device.get_feature_report(0, min(len(full_report), 65))
+                            logger.debug("apply_payload read_back=%s",
+                                         [f"0x{b:02x}" for b in read_back[:16]] if read_back else None)
+                        except Exception as rb_err:
+                            logger.debug("apply_payload read_back failed: %s", rb_err)
                     device.close()
                 except Exception as e:
                     last_err = e
@@ -2337,9 +2502,11 @@ class QMKManager:
                 if rc is None or rc > 0:
                     sent_path = sent_path or path
             if sent_path is None:
+                logger.warning("apply_payload FAILED on all paths, last_err=%s", last_err)
                 print(f"[Ошибка USB] Не удалось отправить HID пакет ни в один интерфейс: {last_err}")
                 return
             self._working_hid_path[cache_key] = sent_path
+            logger.debug("apply_payload SUCCESS on path=%s", sent_path)
             try:
                 if manual:
                     try:
@@ -2366,6 +2533,7 @@ class QMKManager:
                 print(f"[Ошибка] Пост-обработка применения профиля: {e}")
 
     def background_task(self):
+        logger.info("background window scanner started")
         print("[DEBUG] Фоновый сканер окон запущен...")
         while self.is_running:
             mode = self._current_mode()

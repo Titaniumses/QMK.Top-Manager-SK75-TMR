@@ -6,3 +6,4 @@ keyboard
 winotify
 pystray
 Pillow
+websocket-client

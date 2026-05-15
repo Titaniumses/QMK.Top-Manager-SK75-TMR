@@ -15,6 +15,31 @@ _GREEN = (60, 179, 113, 255)    # >=50
 _YELLOW = (229, 165, 10, 255)   # 20..49
 _RED = (208, 68, 55, 255)       # <20
 
+_BASE_ICON_PATH: Optional[str] = None
+_BASE_ICON_CACHE: Optional[Image.Image] = None
+
+
+def set_icon_source(path: Optional[str]) -> None:
+    """Set a base icon (e.g. .ico) used as the tray window icon, with the
+    battery indicator composited as a small badge over the bottom-right."""
+    global _BASE_ICON_PATH, _BASE_ICON_CACHE
+    _BASE_ICON_PATH = path
+    _BASE_ICON_CACHE = None
+
+
+def _load_base_icon() -> Optional[Image.Image]:
+    global _BASE_ICON_CACHE
+    if _BASE_ICON_CACHE is not None:
+        return _BASE_ICON_CACHE
+    if not _BASE_ICON_PATH:
+        return None
+    try:
+        img = Image.open(_BASE_ICON_PATH).convert("RGBA")
+        _BASE_ICON_CACHE = img
+        return img
+    except Exception:
+        return None
+
 
 def _fill_color(percent: int) -> tuple:
     if percent >= 50:
@@ -25,26 +50,35 @@ def _fill_color(percent: int) -> tuple:
 
 
 def render_battery_image(state: BatteryState) -> Image.Image:
-    img = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
+    return _render_battery_badge(state, badge_size=64)
+
+
+def _render_battery_badge(state: BatteryState, badge_size: int = _ICON_SIZE) -> Image.Image:
+    img = Image.new("RGBA", (badge_size, badge_size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    body = (3, 8, 26, 24)
-    nub = (26, 13, 29, 19)
+    scale = badge_size / 32
+
+    def s(*vals):
+        return tuple(int(v * scale) for v in vals)
+
+    body = s(1, 6, 27, 26)
+    nub = s(27, 11, 31, 21)
+    inner_left, inner_top, inner_right, inner_bottom = 3 * scale, 8 * scale, 25 * scale, 24 * scale
 
     if state.is_stale or state.percent is None:
-        draw.rounded_rectangle(body, radius=3, outline=_GREY_COLOR, width=2)
+        draw.rounded_rectangle(body, radius=max(1, int(3 * scale)), outline=_GREY_COLOR, width=max(1, int(2 * scale)))
         draw.rectangle(nub, fill=_GREY_COLOR)
         try:
-            font = ImageFont.truetype("arial.ttf", 14)
+            font = ImageFont.truetype("arial.ttf", int(14 * scale))
         except OSError:
             font = ImageFont.load_default()
-        draw.text((11, 7), "?", fill=_GREY_COLOR, font=font)
+        draw.text(s(11, 7), "?", fill=_GREY_COLOR, font=font)
         return img
 
-    draw.rounded_rectangle(body, radius=3, outline=_OUTLINE_COLOR, width=2)
+    draw.rounded_rectangle(body, radius=max(1, int(3 * scale)), outline=_OUTLINE_COLOR, width=max(1, int(2 * scale)))
     draw.rectangle(nub, fill=_OUTLINE_COLOR)
 
-    inner_left, inner_top, inner_right, inner_bottom = 5, 10, 24, 22
     inner_width = inner_right - inner_left
     fill_width = int(inner_width * (max(0, min(100, state.percent)) / 100))
     if fill_width > 0:
@@ -56,8 +90,8 @@ def render_battery_image(state: BatteryState) -> Image.Image:
 
     if state.charging:
         bolt = [
-            (15, 11), (12, 17), (14, 17),
-            (13, 21), (16, 15), (14, 15),
+            s(15, 11), s(12, 17), s(14, 17),
+            s(13, 21), s(16, 15), s(14, 15),
         ]
         draw.polygon(bolt, fill=(255, 255, 255, 255))
 
@@ -101,7 +135,7 @@ class TrayIcon:
         self._icon = pystray.Icon(
             name="qmk_manager",
             icon=initial,
-            title="QMK Manager — Battery: no data",
+            title="QMK.Top Manager — Battery: no data",
             menu=self._build_menu(),
         )
         self._icon.on_activate = lambda icon: self._on_toggle()
@@ -117,10 +151,10 @@ class TrayIcon:
             return
         self._icon.icon = render_battery_image(state)
         if state.is_stale or state.percent is None:
-            tooltip = "QMK Manager — Battery: no data"
+            tooltip = "QMK.Top Manager — Battery: no data"
         else:
             suffix = " ⚡" if state.charging else ""
-            tooltip = f"QMK Manager — Battery: {state.percent}%{suffix}"
+            tooltip = f"QMK.Top Manager — Battery: {state.percent}%{suffix}"
         self._icon.title = tooltip
 
     def set_window_visible(self, visible: bool) -> None:
