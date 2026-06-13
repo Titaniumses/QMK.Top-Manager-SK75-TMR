@@ -4,6 +4,9 @@
 
 **Automatic profile switching & battery monitoring for qmk.top keyboards**
 
+The app now runs offline by default. Network access is only available if you
+explicitly enable the sniffer or a future update-check hook.
+
 ---
 
 ## 🇷🇺 Русский

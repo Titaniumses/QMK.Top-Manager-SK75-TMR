@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import ctypes
+from pathlib import Path
 import win32gui
 import win32process
 import psutil
@@ -24,6 +25,12 @@ from autostart import paths, acquire_single_instance, bring_existing_to_front
 logger = logging.getLogger(__name__)
 
 CONFIG_FILE = paths.config_path
+OFFLINE_MODE = os.environ.get("QMK_OFFLINE_MODE", "1").strip().lower() not in ("0", "false", "no")
+ENABLE_UPDATE_CHECK = os.environ.get("QMK_ENABLE_UPDATE_CHECK", "0").strip().lower() in ("1", "true", "yes")
+
+_LOCAL_FLET_CLIENT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", "flet-windows.zip")
+if os.path.isfile(_LOCAL_FLET_CLIENT) and not os.environ.get("FLET_CLIENT_URL"):
+    os.environ["FLET_CLIENT_URL"] = Path(_LOCAL_FLET_CLIENT).resolve().as_uri()
 
 KEYBOARD_TYPES = {
     "magnetic":    {"opcode": 0x04, "checksum_base": 0xFB, "profiles": 4},
@@ -235,6 +242,15 @@ def _setup_logging(debug: bool) -> None:
         root.setLevel(logging.WARNING)
 
 
+def _load_local_update_state() -> dict:
+    return {
+        "enabled": False,
+        "checked_at": None,
+        "latest_version": None,
+        "error": None,
+    }
+
+
 def _default_profile_payload(idx: int, opcode: int = 0x04) -> list:
     kb_info = next((v for v in KEYBOARD_TYPES.values() if v["opcode"] == opcode), None)
     checksum_base = kb_info["checksum_base"] if kb_info else 0xFB
@@ -388,6 +404,7 @@ class QMKManager:
         self.bt_charging_mask = None
         self.bt_result = None
         self.detected_browser_path = _find_chrome()
+        self.update_check_state = _load_local_update_state()
 
         self._build_page()
         self._build_ui()
@@ -1252,6 +1269,7 @@ class QMKManager:
             "Запустить sniff",
             icon=ft.Icons.SENSORS_ROUNDED,
             on_click=lambda e: self.toggle_sniffer(),
+            disabled=OFFLINE_MODE,
             style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)),
         )
         self.sniff_clear_button = ft.OutlinedButton(
@@ -1283,6 +1301,7 @@ class QMKManager:
             "Указать браузер…",
             icon=ft.Icons.FOLDER_OPEN_ROUNDED,
             on_click=lambda e: self._open_browser_picker(),
+            disabled=OFFLINE_MODE,
             style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)),
         )
 
@@ -2053,6 +2072,10 @@ class QMKManager:
 
     def toggle_sniffer(self):
         if self.sniffer is None:
+            if OFFLINE_MODE:
+                self.sniff_status.value = "Sniffer disabled in offline mode. Enable it only when you need a one-time capture."
+                self.page.update()
+                return
             browser = self._resolve_browser_path()
             if not browser:
                 self.sniff_status.value = "Браузер не выбран. Жми «Указать браузер…» и выбери chrome.exe / msedge.exe."
@@ -2064,6 +2087,7 @@ class QMKManager:
                     on_event=self._on_sniff_event,
                     on_status=self._on_sniff_status,
                     browser_path=browser,
+                    offline_mode=False,
                 )
                 self._battery_captured_this_session = False
                 self._battery_capture_attempts = 0
@@ -2085,6 +2109,17 @@ class QMKManager:
         self.sniff_button.text = "Запустить sniff"
         self.sniff_button.icon = ft.Icons.SENSORS_ROUNDED
         self.page.update()
+
+    def _maybe_check_updates(self):
+        if not ENABLE_UPDATE_CHECK:
+            self.update_check_state = _load_local_update_state()
+            return
+        self.update_check_state = {
+            "enabled": True,
+            "checked_at": None,
+            "latest_version": None,
+            "error": "Update check hook not wired yet.",
+        }
 
     def _on_sniff_status(self, msg: str):
         def upd():

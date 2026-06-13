@@ -1,8 +1,7 @@
 """HID sniffer that drives a controlled Chrome instance via CDP.
 
-Launches Chrome with remote debugging, navigates to qmk.top, injects sniffer.js
-augmented with a Python binding so each captured HID frame is delivered to a
-Python callback in real time. No kernel drivers, no extra installs (Chrome only).
+The sniffer is strictly opt-in. It is not started on app launch and is only
+used when the user explicitly opens the sniff UI and presses Start.
 """
 from __future__ import annotations
 
@@ -16,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from typing import Callable, Optional
 
@@ -153,11 +153,13 @@ class HIDSniffer:
         on_status: Callable[[str], None] | None = None,
         url: str = "https://qmk.top",
         browser_path: Optional[str] = None,
+        offline_mode: bool = False,
     ):
         self.on_event = on_event
         self.on_status = on_status or (lambda s: None)
         self.url = url
         self.browser_path = browser_path
+        self.offline_mode = offline_mode
         self.proc: Optional[subprocess.Popen] = None
         self.profile_dir: Optional[str] = None
         self.port: int = 0
@@ -168,6 +170,8 @@ class HIDSniffer:
 
     # ---------- public ----------
     def start(self) -> None:
+        if self.offline_mode:
+            raise RuntimeError("Sniffer is disabled in offline mode.")
         try:
             with open(DEBUG_LOG_PATH, "w", encoding="utf-8") as f:
                 f.write(f"=== sniffer start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
