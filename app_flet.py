@@ -1,3 +1,4 @@
+import argparse
 import flet as ft
 import hid
 import json
@@ -12,22 +13,215 @@ import win32gui
 import win32process
 import psutil
 import keyboard
+from dataclasses import dataclass, field
+from enum import IntEnum, Flag, auto
 from winotify import Notification
 from battery import BatteryMonitor, BatteryState
 from tray import TrayIcon, set_icon_source
 from sniffer import HIDSniffer, _find_chrome, is_chromium_executable
+from autostart import paths, acquire_single_instance, bring_existing_to_front
 
 logger = logging.getLogger(__name__)
 
-CONFIG_FILE = "profiles_config.json"
+CONFIG_FILE = paths.config_path
+
+KEYBOARD_TYPES = {
+    "magnetic":    {"opcode": 0x04, "checksum_base": 0xFB, "profiles": 4},
+    "mechanical":  {"opcode": 0x05, "checksum_base": 0xFA, "profiles": 3},
+}
 PROFILE_COUNT = 4
+
+
+class PollingRate(IntEnum):
+    HZ_125  = 125
+    HZ_250  = 250
+    HZ_500  = 500
+    HZ_1000 = 1000
+    HZ_2000 = 2000
+    HZ_4000 = 4000
+    HZ_8000 = 8000
+
+
+POLLING_RATE_CODES: dict[PollingRate, int] = {
+    PollingRate.HZ_125:  6,
+    PollingRate.HZ_250:  5,
+    PollingRate.HZ_500:  4,
+    PollingRate.HZ_1000: 3,
+    PollingRate.HZ_2000: 2,
+    PollingRate.HZ_4000: 1,
+    PollingRate.HZ_8000: 0,
+}
+
+VALID_POLLING_RATES = {r.value for r in PollingRate}
+
+LIGHTING_PROFILE_COUNT = 5
+VALID_LIGHTING_PROFILES = set(range(LIGHTING_PROFILE_COUNT))
+
+
+# ---------------------------------------------------------------------------
+# Device capability system
+# ---------------------------------------------------------------------------
+
+class DeviceCapability(Flag):
+    PROFILE_SWITCH = auto()
+    HOTKEYS = auto()
+    LIGHTING_PROFILES = auto()
+    POLLING_RATE = auto()
+    PROCESS_RULES = auto()
+
+_CAP_MAGNETIC = (
+    DeviceCapability.PROFILE_SWITCH
+    | DeviceCapability.HOTKEYS
+    | DeviceCapability.LIGHTING_PROFILES
+    | DeviceCapability.POLLING_RATE
+    | DeviceCapability.PROCESS_RULES
+)
+_CAP_MECHANICAL = (
+    DeviceCapability.PROFILE_SWITCH
+    | DeviceCapability.HOTKEYS
+    | DeviceCapability.PROCESS_RULES
+)
+
+_CAPABILITY_MAP: dict[str | None, DeviceCapability] = {
+    "magnetic": _CAP_MAGNETIC,
+    "mechanical": _CAP_MECHANICAL,
+    None: DeviceCapability(0),
+}
+
+def device_capabilities(keyboard_type: str | None) -> DeviceCapability:
+    return _CAPABILITY_MAP.get(keyboard_type, DeviceCapability(0))
+
+def has_capability(keyboard_type: str | None, cap: DeviceCapability) -> bool:
+    return cap in device_capabilities(keyboard_type)
+
+
+# ---------------------------------------------------------------------------
+# Process-rule evaluator
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProcessRule:
+    process: str
+    profile_index: int
+    enabled: bool = True
+
+class RuleEvaluator:
+    def __init__(self):
+        self._rules: list[ProcessRule] = []
+        self._active_index: dict[str, int] = {}
+
+    def load(self, bindings: list[dict]):
+        self._rules = [
+            ProcessRule(
+                process=b["process"],
+                profile_index=b["profile_index"],
+                enabled=b.get("enabled", True),
+            )
+            for b in bindings
+            if "profile_index" in b
+        ]
+        self._rebuild_index()
+
+    def _rebuild_index(self):
+        self._active_index = {r.process: r.profile_index for r in self._rules if r.enabled}
+
+    def match(self, process_name: str) -> int | None:
+        return self._active_index.get(process_name)
+
+    def is_disabled_match(self, process_name: str) -> ProcessRule | None:
+        for r in self._rules:
+            if r.process == process_name and not r.enabled:
+                return r
+        return None
+
+    def set_enabled(self, process: str, enabled: bool):
+        for r in self._rules:
+            if r.process == process:
+                r.enabled = enabled
+                break
+        self._rebuild_index()
+
+    def to_config(self) -> list[dict]:
+        return [
+            {"process": r.process, "profile_index": r.profile_index, "enabled": r.enabled}
+            for r in self._rules
+        ]
+
+    @property
+    def all_rules(self) -> list[ProcessRule]:
+        return list(self._rules)
+
+
+def _polling_rate_payload(rate: PollingRate) -> list:
+    code = POLLING_RATE_CODES[rate]
+    payload = [0] * 64
+    payload[0] = 0x03
+    payload[2] = code
+    payload[7] = (255 - sum(payload[0:7])) & 0xFF
+    return payload
+
+
+def _lighting_profile_payload(index: int) -> list:
+    payload = [0] * 64
+    payload[0] = 0x07
+    payload[1] = 0x0D
+    payload[2] = 0x04
+    payload[3] = 0x04
+    payload[4] = (index & 0xFF) * 0x10
+    payload[6] = 0xC8
+    payload[7] = 0xC8
+    payload[8] = (511 - sum(payload[0:8])) & 0xFF
+    return payload
+
+
+DEFAULT_BATTERY_QUERY = [0xF7] + [0] * 63
+
+WIRED_STAGE_DELAYS_MS = {
+    "profile": 50,
+    "polling": 30,
+    "lighting": 30,
+}
+
+WIRELESS_STAGE_DELAYS_MS = {
+    "profile": 300,
+    "polling": 200,
+    "lighting": 150,
+}
+
+
+def _resolved_cooldown_ms(entry: dict | None) -> int:
+    if not entry:
+        return 0
+    transport = entry.get("transport") or "wired"
+    kb_type = entry.get("keyboard_type")
+    if transport == "wireless":
+        for key in ("cooldown_wireless_ms", "cooldown_ms"):
+            value = entry.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+        if kb_type == "mechanical":
+            return 2000
+        return 250
+    for key in ("cooldown_wired_ms", "cooldown_ms"):
+        value = entry.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    if kb_type == "mechanical":
+        return 1000
+    return 100
+
+
+def _stage_delay_ms(entry: dict | None, stage: str) -> int:
+    transport = (entry or {}).get("transport") or "wired"
+    delays = WIRELESS_STAGE_DELAYS_MS if transport == "wireless" else WIRED_STAGE_DELAYS_MS
+    return delays.get(stage, 0)
 
 
 def _setup_logging(debug: bool) -> None:
     root = logging.getLogger()
     root.handlers.clear()
     if debug:
-        handler = logging.FileHandler("debug.log", mode="w", encoding="utf-8")
+        handler = logging.FileHandler(paths.log_path, mode="w", encoding="utf-8")
         handler.setFormatter(logging.Formatter(
             "[%(asctime)s.%(msecs)03d] [%(levelname)s] [%(name)s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
@@ -41,14 +235,66 @@ def _setup_logging(debug: bool) -> None:
         root.setLevel(logging.WARNING)
 
 
-def _default_profile_payload(idx: int) -> list:
-    """qmk.top static profile-switch frame for slot `idx` (0..3).
-    Frame: [0x04, idx, 0,0,0,0,0, 0xFB - idx, 0×56] (64 bytes)."""
+def _default_profile_payload(idx: int, opcode: int = 0x04) -> list:
+    kb_info = next((v for v in KEYBOARD_TYPES.values() if v["opcode"] == opcode), None)
+    checksum_base = kb_info["checksum_base"] if kb_info else 0xFB
     payload = [0] * 64
-    payload[0] = 0x04
+    payload[0] = opcode
     payload[1] = idx & 0xFF
-    payload[7] = (0xFB - idx) & 0xFF
+    payload[7] = (checksum_base - idx) & 0xFF
     return payload
+
+def _release_all_keys():
+    user32 = ctypes.windll.user32
+    KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+    _modifiers = [
+        (0xA0, 0x2A, False),   # VK_LSHIFT
+        (0xA1, 0x36, False),   # VK_RSHIFT
+        (0xA2, 0x1D, False),   # VK_LCONTROL
+        (0xA3, 0x1D, True),    # VK_RCONTROL (extended)
+        (0xA4, 0x38, False),   # VK_LMENU (Alt)
+        (0xA5, 0x38, True),    # VK_RMENU (extended)
+        (0x5B, 0x5B, True),    # VK_LWIN
+        (0x5C, 0x5C, True),    # VK_RWIN
+    ]
+    for vk, scan, extended in _modifiers:
+        flags = KEYEVENTF_KEYUP | (KEYEVENTF_EXTENDEDKEY if extended else 0)
+        user32.keybd_event(vk, scan, flags, 0)
+    for vk in range(0x08, 0xFF):
+        if user32.GetAsyncKeyState(vk) & 0x8000:
+            user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+
+
+def _suppress_keyboard(duration_ms):
+    def _suppress_callback(event):
+        if event.event_type == keyboard.KEY_UP:
+            return True
+        return False
+
+    hook = keyboard.hook(_suppress_callback, suppress=True)
+    logger.debug("_suppress_keyboard: hook installed for %dms", duration_ms)
+
+    _release_all_keys()
+
+    def _unhook_later():
+        time.sleep(duration_ms / 1000.0)
+        keyboard.unhook(hook)
+        logger.debug("_suppress_keyboard: hook removed")
+
+    threading.Thread(target=_unhook_later, daemon=True).start()
+
+
+def _suppress_keyboard_start():
+    def _suppress_callback(event):
+        if event.event_type == keyboard.KEY_UP:
+            return True
+        return False
+    hook = keyboard.hook(_suppress_callback, suppress=True)
+    _release_all_keys()
+    logger.debug("_suppress_keyboard_start: hook installed (transaction-bound)")
+    return hook
+
 
 try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("QMK.Top.Manager.1")
@@ -68,6 +314,18 @@ class QMKManager:
         _setup_logging(self.config.get("settings", {}).get("debug", False))
         logger.info("app started, config loaded")
         self._ensure_active_device_aliases()
+        dev = self.config.get("device") or {}
+        if dev and self.config.get("settings", {}).get("debug"):
+            vid, pid = dev.get("vid", 0), dev.get("pid", 0)
+            logger.debug("=== HID device map for VID=0x%04x PID=0x%04x ===", vid, pid)
+            for d in hid.enumerate(vid, pid):
+                logger.debug("  path=%s usage_page=0x%04x usage=0x%04x "
+                             "interface=%d product=%s",
+                             d["path"], d["usage_page"], d["usage"],
+                             d.get("interface_number", -1),
+                             d.get("product_string", "?"))
+            logger.debug("=== end HID device map ===")
+            self._diagnose_hid_endpoints()
         self.is_running = False
         self.worker_thread = None
         self.usb_lock = threading.Lock()
@@ -91,14 +349,17 @@ class QMKManager:
             get_device_path=self.get_keyboard_path_safe,
             get_device_paths=self.get_keyboard_paths,
             on_working_path=self._cache_working_path,
+            default_query=DEFAULT_BATTERY_QUERY,
         )
         self.battery_thread = None
         self.current_binding = None
         self.last_active_window = None
         self.binds_dict = {}
+        self.rule_evaluator = RuleEvaluator()
         _entry = self._active_device()
         _dpi = _entry.get("default_profile_index") if _entry else None
-        self.default_profile_index = _dpi if isinstance(_dpi, int) and 0 <= _dpi < PROFILE_COUNT else None
+        _pc = self._device_profile_count()
+        self.default_profile_index = _dpi if isinstance(_dpi, int) and 0 <= _dpi < _pc else None
         self.devices = []
         self.filtered_devices = []
         self.sniffer = None
@@ -136,6 +397,11 @@ class QMKManager:
 
         self.tray.start()
 
+        def _initial_battery():
+            time.sleep(2)
+            self._refresh_battery_for_tray()
+        threading.Thread(target=_initial_battery, daemon=True).start()
+
         if self.config.get("settings", {}).get("start_minimized", False):
             self.tray.set_window_visible(False)
 
@@ -171,15 +437,39 @@ class QMKManager:
 
     @staticmethod
     def _detect_transport(hid_dev) -> str:
-        """Auto-detect 'wired' vs 'wireless' from HID device strings.
-        Wireless markers: '2.4g', '2.4 g', 'wireless', 'dongle', 'rf receiver'.
-        Default: 'wired'."""
-        markers = ("2.4g", "2.4 g", "wireless", "dongle", "rf receiver")
-        haystack = " ".join(
-            (hid_dev.get(k) or "")
-            for k in ("product_string", "manufacturer_string")
-        ).lower()
-        return "wireless" if any(m in haystack for m in markers) else "wired"
+        text = " ".join([
+            hid_dev.get("product_string") or "",
+            hid_dev.get("manufacturer_string") or "",
+        ]).lower()
+        wireless_markers = ("2.4g", "2.4 g", "wireless", "dongle", "rf receiver")
+        return "wireless" if any(marker in text for marker in wireless_markers) else "wired"
+
+    def _device_profile_count(self) -> int:
+        entry = self._active_device()
+        kb_type = entry.get("keyboard_type") if entry else None
+        info = KEYBOARD_TYPES.get(kb_type)
+        return info["profiles"] if info else KEYBOARD_TYPES["magnetic"]["profiles"]
+
+    def _device_opcode(self) -> int:
+        entry = self._active_device()
+        kb_type = entry.get("keyboard_type") if entry else None
+        info = KEYBOARD_TYPES.get(kb_type)
+        return info["opcode"] if info else KEYBOARD_TYPES["magnetic"]["opcode"]
+
+    def _profile_payload_at(self, index: int) -> list:
+        info = self._profile_info_at(index)
+        if info and info.get("data"):
+            return info["data"]
+        return _default_profile_payload(index, self._device_opcode())
+
+    def _detect_transport_for_active(self) -> str:
+        dev = self.config.get("device") or {}
+        if not dev:
+            return "wired"
+        vid, pid = dev.get("vid", 0), dev.get("pid", 0)
+        for d in hid.enumerate(vid, pid):
+            return self._detect_transport(d)
+        return "wired"
 
     def _probe_battery_percent(self, hid_dev):
         """Synchronously query battery on a specific HID device and return percent (0..100) or None.
@@ -190,6 +480,8 @@ class QMKManager:
         """
         key = self._device_key_of(hid_dev)
         entry = self.config["devices"].get(key) or {}
+        if entry.get("keyboard_type") is None:
+            return None
         batt = entry.get("battery") or {}
         query = batt.get("query") or []
         if not query:
@@ -259,10 +551,9 @@ class QMKManager:
             "usage_page": int(usage_page),
             "label": label or "",
             "transport": None,
-            "payloads": {
-                f"Профиль {i + 1}": {"data": _default_profile_payload(i), "hotkey": ""}
-                for i in range(PROFILE_COUNT)
-            },
+            "keyboard_type": None,
+            "cooldown_ms": 0,
+            "payloads": {},
             "bindings": [],
             "default_profile_index": None,
             "battery": {
@@ -279,20 +570,36 @@ class QMKManager:
     def _normalize_device_entry(self, entry):
         entry.setdefault("label", "")
         entry.setdefault("transport", None)
+        entry.setdefault("keyboard_type", None)
+        entry.setdefault("cooldown_ms", 0)
+        kb_type = entry.get("keyboard_type")
+        if kb_type is not None and kb_type not in KEYBOARD_TYPES:
+            logger.warning("Unknown keyboard_type '%s', reset to null", kb_type)
+            entry["keyboard_type"] = None
+            kb_type = None
+        if kb_type is None:
+            entry.setdefault("payloads", {})
+            entry.setdefault("bindings", [])
+            entry.setdefault("default_profile_index", None)
+            entry.setdefault("battery", {
+                "query": [], "report_id": 0, "response_length": 65,
+                "response_offset": 2, "response_scale": 1,
+                "charging_offset": None, "charging_mask": 0,
+            })
+            return
+        kb_info = KEYBOARD_TYPES[kb_type]
+        pc = kb_info["profiles"]
         payloads = entry.get("payloads") or {}
         if not isinstance(payloads, dict):
             payloads = {}
-        items = list(payloads.items())[:PROFILE_COUNT]
-        while len(items) < PROFILE_COUNT:
-            items.append((f"Профиль {len(items) + 1}", {"data": [], "hotkey": ""}))
+        items = list(payloads.items())[:pc]
+        while len(items) < pc:
+            items.append((f"Профиль {len(items) + 1}", {"hotkey": ""}))
         new_payloads = {}
         for slot_idx, (name, info) in enumerate(items):
             if not isinstance(info, dict):
-                info = {"data": info if isinstance(info, list) else [], "hotkey": ""}
-            info.setdefault("data", [])
+                info = {"hotkey": ""}
             info.setdefault("hotkey", "")
-            if not info["data"]:
-                info["data"] = _default_profile_payload(slot_idx)
             new_payloads[name] = info
         entry["payloads"] = new_payloads
 
@@ -301,7 +608,7 @@ class QMKManager:
         for b in entry.get("bindings", []) or []:
             if not isinstance(b, dict) or "process" not in b:
                 continue
-            if "profile_index" in b and isinstance(b["profile_index"], int) and 0 <= b["profile_index"] < PROFILE_COUNT:
+            if "profile_index" in b and isinstance(b["profile_index"], int) and 0 <= b["profile_index"] < pc:
                 new_bindings.append({"process": b["process"], "profile_index": b["profile_index"]})
                 continue
             old_name = b.get("profile_name")
@@ -311,7 +618,7 @@ class QMKManager:
 
         # Migrate legacy "default" pseudo-binding into a dedicated field.
         dpi = entry.get("default_profile_index")
-        if not isinstance(dpi, int) or not (0 <= dpi < PROFILE_COUNT):
+        if not isinstance(dpi, int) or not (0 <= dpi < pc):
             dpi = None
             for b in list(entry["bindings"]):
                 if b.get("process") == "default" and isinstance(b.get("profile_index"), int):
@@ -347,6 +654,8 @@ class QMKManager:
             "settings": {
                 "start_minimized": False,
                 "autostart_service": True,
+                "autostart": False,
+                "startup_delay_sec": 5,
                 "browser_path": "",
                 "debug": False,
             },
@@ -441,6 +750,13 @@ class QMKManager:
     def _activate_device(self, key):
         if key not in self.config.get("devices", {}):
             return False
+        entry = self.config["devices"][key]
+        if entry.get("keyboard_type") is None:
+            self.config["active_device"] = key
+            self._ensure_active_device_aliases()
+            self.save_config()
+            self._show_setup_wizard(key)
+            return True
         was_running = self.is_running
         if was_running:
             self.is_running = False
@@ -488,10 +804,6 @@ class QMKManager:
             self._update_transport_icon()
         except Exception:
             pass
-        try:
-            self._sync_transport_override_ui()
-        except Exception:
-            pass
         return True
 
     def _ensure_device_entry(self, hid_dev):
@@ -529,6 +841,9 @@ class QMKManager:
         if 0 <= index < len(items):
             return items[index][1]
         return None
+
+    def _profile_info_at_by_name(self, name):
+        return self.config.get("payloads", {}).get(name)
 
     def _rename_profile_at(self, index, new_name):
         items = self._profile_items()
@@ -571,30 +886,38 @@ class QMKManager:
         self.config.setdefault("settings", {})[key] = bool(value)
         self.save_config()
 
+    def _on_autostart_windows_changed(self, e):
+        from autostart import set_autostart
+        enable = e.control.value
+        set_autostart(enable)
+        self.config.setdefault("settings", {})["autostart"] = enable
+        self.save_config()
+
     def reload_runtime_state(self):
         try:
             keyboard.unhook_all()
         except Exception:
             pass
         registered = 0
-        for prof_name, info in self._profile_items():
+        for idx, (prof_name, info) in enumerate(self._profile_items()):
             hk = info.get("hotkey")
-            data = info.get("data") or []
-            if not hk or not data:
+            if not hk:
                 continue
+            payload = self._profile_payload_at(idx)
             try:
                 keyboard.add_hotkey(
                     hk,
-                    lambda name=prof_name, data=data:
+                    lambda name=prof_name, data=payload:
                         self.apply_payload(name, data, manual=True)
                 )
                 registered += 1
             except Exception as e:
                 print(f"[Хоткей] Ошибка регистрации {hk}: {e}")
-        self.binds_dict = {b["process"]: b["profile_index"] for b in self.config["bindings"] if "profile_index" in b}
+        self.rule_evaluator.load(self.config.get("bindings", []))
+        self.binds_dict = self.rule_evaluator._active_index
         entry = self._active_device()
         dpi = entry.get("default_profile_index") if entry else None
-        self.default_profile_index = dpi if isinstance(dpi, int) and 0 <= dpi < PROFILE_COUNT else None
+        self.default_profile_index = dpi if isinstance(dpi, int) and 0 <= dpi < self._device_profile_count() else None
         self.last_active_window = None
         print(f"[Reload] Хоткеев: {registered}, биндингов: {len(self.binds_dict)}")
 
@@ -770,18 +1093,20 @@ class QMKManager:
             style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)),
         )
 
+        device_card_controls = [
+            ft.Row([self.device_dropdown, refresh_btn], spacing=8),
+        ]
+        if self.config.get("settings", {}).get("debug", False):
+            device_card_controls.append(
+                ft.Row([sniffer_open_btn], alignment=ft.MainAxisAlignment.END),
+            )
+
         device_card = self._card(
             icon=ft.Icons.USB_ROUNDED,
             title="Устройство",
             subtitle="Выберите QMK-клавиатуру из списка.",
             content=ft.Container(
-                ft.Column(
-                    [
-                        ft.Row([self.device_dropdown, refresh_btn], spacing=8),
-                        ft.Row([sniffer_open_btn], alignment=ft.MainAxisAlignment.END),
-                    ],
-                    spacing=10,
-                ),
+                ft.Column(device_card_controls, spacing=10),
                 margin=ft.Margin.only(top=12),
             ),
         )
@@ -829,11 +1154,20 @@ class QMKManager:
             value=settings.get("autostart_service", True),
             on_change=lambda e: self._set_setting("autostart_service", e.control.value),
         )
+        from autostart import autostart_enabled, set_autostart
+        self.autostart_windows_switch = ft.Switch(
+            value=autostart_enabled(),
+            on_change=self._on_autostart_windows_changed,
+        )
+        self.notifications_switch = ft.Switch(
+            value=settings.get("notifications", True),
+            on_change=lambda e: self._set_setting("notifications", e.control.value),
+        )
 
         settings_card = self._card(
             icon=ft.Icons.SETTINGS_ROUNDED,
-            title="Настройки запуска",
-            subtitle="Применяются при следующем запуске программы.",
+            title="Настройки",
+            subtitle="Параметры запуска и поведения приложения.",
             content=ft.Column(
                 [
                     ft.Row(
@@ -866,6 +1200,40 @@ class QMKManager:
                                 spacing=2, expand=True,
                             ),
                             self.autostart_switch,
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Divider(height=1, opacity=0.2),
+                    ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text("Запускать с Windows", size=13),
+                                    ft.Text(
+                                        "Приложение будет запускаться автоматически при входе в систему.",
+                                        size=11, color=ft.Colors.ON_SURFACE_VARIANT, italic=True,
+                                    ),
+                                ],
+                                spacing=2, expand=True,
+                            ),
+                            self.autostart_windows_switch,
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Divider(height=1, opacity=0.2),
+                    ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text("Уведомления", size=13),
+                                    ft.Text(
+                                        "Показывать Windows-уведомления при переключении профиля.",
+                                        size=11, color=ft.Colors.ON_SURFACE_VARIANT, italic=True,
+                                    ),
+                                ],
+                                spacing=2, expand=True,
+                            ),
+                            self.notifications_switch,
                         ],
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     ),
@@ -1029,48 +1397,20 @@ class QMKManager:
         for d in self.filtered_devices:
             self._ensure_device_entry(d)
 
-        # Battery probe → transport classification.
-        # Если устройство возвращает осмысленный процент заряда — это wireless.
-        # Если нет — wired (проводной режим заряд не отдаёт). Транспорт пишем
-        # в config и в дропдауне оставляем только устройства соответствующего типа.
-        # Устройства с `transport_locked=True` (ручной выбор пользователем)
-        # пробу игнорируют и из списка не отфильтровываются.
-        probe_results = {}
-        any_wireless = False
-        for d in self.filtered_devices:
-            key = self._device_key_of(d)
-            entry = self.config["devices"].get(key) or {}
-            if entry.get("transport_locked"):
-                probe_results[key] = None
-                continue
-            pct = self._probe_battery_percent(d)
-            probe_results[key] = pct
-            if pct is not None:
-                any_wireless = True
-
+        # Auto-detect transport by device name (no manual override needed).
         cfg_dirty = False
         for d in self.filtered_devices:
             key = self._device_key_of(d)
             entry = self.config["devices"].get(key)
             if entry is None:
                 continue
-            if entry.get("transport_locked"):
-                continue
-            new_transport = "wireless" if probe_results[key] is not None else "wired"
+            new_transport = self._detect_transport(d)
             if entry.get("transport") != new_transport:
                 entry["transport"] = new_transport
                 cfg_dirty = True
         if cfg_dirty:
             self.save_config()
 
-        target_transport = "wireless" if any_wireless else "wired"
-        self.filtered_devices = [
-            d for d in self.filtered_devices
-            if (
-                (self.config["devices"].get(self._device_key_of(d)) or {}).get("transport") == target_transport
-                or (self.config["devices"].get(self._device_key_of(d)) or {}).get("transport_locked")
-            )
-        ]
         custom_devices = self.filtered_devices
 
         options = []
@@ -1084,35 +1424,9 @@ class QMKManager:
                 f"{badge} {label_prefix} · VID {hex(d['vendor_id'])} · PID {hex(d['product_id'])} · Page {hex(d['usage_page'])}"
             )
             vid, pid, up = d['vendor_id'], d['product_id'], d['usage_page']
-            wired_btn = ft.IconButton(
-                icon=ft.Icons.USB,
-                tooltip="Пометить как проводное",
-                selected=(transport == "wired"),
-                selected_icon=ft.Icons.USB,
-                icon_color=ft.Colors.ON_SURFACE_VARIANT,
-                selected_icon_color=ft.Colors.PRIMARY,
-                style=ft.ButtonStyle(
-                    bgcolor={"selected": ft.Colors.PRIMARY_CONTAINER, "": ft.Colors.TRANSPARENT},
-                ),
-                on_click=lambda e, v=vid, p=pid, u=up: self._set_device_transport(v, p, u, "wired"),
-            )
-            wireless_btn = ft.IconButton(
-                icon=ft.Icons.WIFI_TETHERING_ROUNDED,
-                tooltip="Пометить как беспроводное",
-                selected=(transport == "wireless"),
-                selected_icon=ft.Icons.WIFI_TETHERING_ROUNDED,
-                icon_color=ft.Colors.ON_SURFACE_VARIANT,
-                selected_icon_color=ft.Colors.PRIMARY,
-                style=ft.ButtonStyle(
-                    bgcolor={"selected": ft.Colors.PRIMARY_CONTAINER, "": ft.Colors.TRANSPARENT},
-                ),
-                on_click=lambda e, v=vid, p=pid, u=up: self._set_device_transport(v, p, u, "wireless"),
-            )
             row = ft.Row(
                 [
                     ft.Text(label_text, expand=True, overflow=ft.TextOverflow.ELLIPSIS),
-                    wired_btn,
-                    wireless_btn,
                 ],
                 spacing=4,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1126,12 +1440,12 @@ class QMKManager:
         self.device_dropdown.value = target_key
         if target_key and target_key != active_key:
             self._activate_device(target_key)
+        elif target_key:
+            entry = self.config["devices"].get(target_key)
+            if entry and entry.get("keyboard_type") is None:
+                self._show_setup_wizard(target_key)
         try:
             self._update_transport_icon()
-        except Exception:
-            pass
-        try:
-            self._sync_transport_override_ui()
         except Exception:
             pass
         self.page.update()
@@ -1219,8 +1533,15 @@ class QMKManager:
         )
         self.page.show_dialog(dlg)
     def open_profile_dialog(self, index):
-        info = self._profile_info_at(index) or {"data": [], "hotkey": ""}
+        info = self._profile_info_at(index) or {"hotkey": ""}
         current_name = self._profile_name_at(index) or f"Профиль {index + 1}"
+        current_hotkey = info.get("hotkey", "")
+
+        other_hotkeys = {}
+        for idx, (pname, pinfo) in enumerate(self._profile_items()):
+            hk = (pinfo.get("hotkey") or "").strip().lower()
+            if hk and idx != index:
+                other_hotkeys[hk] = pname
 
         name_field = ft.TextField(
             label="Название профиля",
@@ -1229,20 +1550,151 @@ class QMKManager:
             border_radius=12,
             filled=True,
         )
-        hotkey_field = ft.TextField(
+
+        hotkey_display = ft.TextField(
             label="Горячая клавиша",
-            hint_text="Например: ctrl+shift+1",
-            value=info.get("hotkey", ""),
+            hint_text="Кликни и нажми сочетание",
+            value=current_hotkey,
             border_radius=12,
             filled=True,
+            read_only=True,
         )
+        hotkey_conflict = ft.Text("", size=11, color=ft.Colors.ERROR, visible=False)
+        hotkey_state = {"capturing": False, "hook": None, "value": current_hotkey,
+                        "mods": set()}
+
+        _MOD_NAMES = {
+            "ctrl", "left ctrl", "right ctrl",
+            "shift", "left shift", "right shift",
+            "alt", "left alt", "right alt",
+            "left windows", "right windows",
+        }
+        _MOD_CANONICAL = {
+            "ctrl": "ctrl", "left ctrl": "ctrl", "right ctrl": "ctrl",
+            "shift": "shift", "left shift": "shift", "right shift": "shift",
+            "alt": "alt", "left alt": "alt", "right alt": "alt",
+            "left windows": "win", "right windows": "win",
+        }
+
+        def _on_hotkey_capture(event):
+            name = (event.name or "").lower()
+            if event.event_type == keyboard.KEY_DOWN:
+                if name in _MOD_NAMES:
+                    hotkey_state["mods"].add(_MOD_CANONICAL[name])
+                    return
+                mod_order = ["ctrl", "shift", "alt", "win"]
+                parts = [m for m in mod_order if m in hotkey_state["mods"]]
+                parts.append(name)
+                combo = "+".join(parts)
+                hotkey_state["mods"].clear()
+
+                conflict_profile = other_hotkeys.get(combo)
+                def _update_ui():
+                    if conflict_profile:
+                        hotkey_conflict.value = f"Конфликт: «{combo}» уже используется в «{conflict_profile}»"
+                        hotkey_conflict.visible = True
+                    else:
+                        hotkey_conflict.visible = False
+                    hotkey_state["value"] = combo
+                    hotkey_display.value = combo
+                    self.page.update()
+                self._ui_call(_update_ui)
+            elif event.event_type == keyboard.KEY_UP:
+                if name in _MOD_NAMES:
+                    hotkey_state["mods"].discard(_MOD_CANONICAL[name])
+
+        def _start_capture(e):
+            if hotkey_state["capturing"]:
+                return
+            hotkey_state["capturing"] = True
+            hotkey_state["mods"].clear()
+            hotkey_display.hint_text = "Нажми сочетание клавиш..."
+            hotkey_display.border_color = ft.Colors.PRIMARY
+            try:
+                keyboard.unhook_all()
+            except Exception:
+                pass
+            hotkey_state["hook"] = keyboard.hook(_on_hotkey_capture, suppress=True)
+            self.page.update()
+
+        def _stop_capture():
+            if not hotkey_state["capturing"]:
+                return
+            hotkey_state["capturing"] = False
+            hotkey_state["mods"].clear()
+            if hotkey_state["hook"]:
+                try:
+                    keyboard.unhook(hotkey_state["hook"])
+                except Exception:
+                    pass
+                hotkey_state["hook"] = None
+            hotkey_display.hint_text = "Кликни и нажми сочетание"
+            hotkey_display.border_color = None
+            self.reload_runtime_state()
+
+        hotkey_display.on_focus = _start_capture
+
+        clear_btn = ft.IconButton(
+            icon=ft.Icons.CLEAR_ROUNDED,
+            tooltip="Очистить хоткей",
+            icon_size=18,
+            on_click=lambda e: _clear_hotkey(),
+        )
+
+        def _clear_hotkey():
+            hotkey_state["value"] = ""
+            hotkey_display.value = ""
+            hotkey_conflict.visible = False
+            _stop_capture()
+            self.page.update()
+
+        hotkey_row = ft.Row([hotkey_display, clear_btn], spacing=4,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+        entry = self._active_device()
+        kb_type = entry.get("keyboard_type") if entry else None
+        caps = device_capabilities(kb_type)
+
+        polling_dropdown = None
+        lighting_dropdown = None
+        if DeviceCapability.POLLING_RATE in caps:
+            current_pr = info.get("polling_rate")
+            pr_options = [ft.dropdown.Option(key="none", text="Не менять")]
+            for r in PollingRate:
+                pr_options.append(ft.dropdown.Option(key=str(r.value), text=f"{r.value} Hz"))
+            polling_dropdown = ft.Dropdown(
+                label="Polling Rate",
+                options=pr_options,
+                value=str(current_pr) if current_pr and current_pr in VALID_POLLING_RATES else "none",
+                border_radius=12,
+                filled=True,
+            )
+
+        if DeviceCapability.LIGHTING_PROFILES in caps:
+            current_lp = info.get("lighting_profile")
+            lp_options = [ft.dropdown.Option(key="none", text="Не менять")]
+            for i in range(LIGHTING_PROFILE_COUNT):
+                lp_options.append(ft.dropdown.Option(key=str(i), text=f"Подсветка {i + 1}"))
+            lighting_dropdown = ft.Dropdown(
+                label="Профиль подсветки",
+                options=lp_options,
+                value=str(current_lp) if current_lp is not None and current_lp in VALID_LIGHTING_PROFILES else "none",
+                border_radius=12,
+                filled=True,
+            )
+
+        dialog_fields = [name_field, hotkey_row, hotkey_conflict]
+        if polling_dropdown:
+            dialog_fields.append(polling_dropdown)
+        if lighting_dropdown:
+            dialog_fields.append(lighting_dropdown)
 
         dlg = ft.AlertDialog(
             modal=True,
             title=ft.Text(f"Профиль {index + 1}"),
             content=ft.Container(
                 content=ft.Column(
-                    [name_field, hotkey_field],
+                    dialog_fields,
                     spacing=12,
                     tight=True,
                 ),
@@ -1252,18 +1704,35 @@ class QMKManager:
         )
 
         def on_cancel(e):
+            _stop_capture()
             self.page.pop_dialog()
 
         def on_save(e):
+            _stop_capture()
             new_name = name_field.value.strip()
-            hk_val = (hotkey_field.value or "").strip().lower()
+            hk_val = (hotkey_state["value"] or "").strip().lower()
             if not new_name:
                 self._snack("Имя профиля обязательно")
+                return
+            if hk_val and hk_val in other_hotkeys:
+                self._snack(f"Хоткей «{hk_val}» уже используется в «{other_hotkeys[hk_val]}»")
                 return
             if not self._rename_profile_at(index, new_name):
                 self._snack("Имя занято другим профилем")
                 return
             self.config["payloads"][new_name]["hotkey"] = hk_val
+            if polling_dropdown:
+                pr_val = polling_dropdown.value
+                if pr_val and pr_val != "none":
+                    self.config["payloads"][new_name]["polling_rate"] = int(pr_val)
+                else:
+                    self.config["payloads"][new_name].pop("polling_rate", None)
+            if lighting_dropdown:
+                lp_val = lighting_dropdown.value
+                if lp_val and lp_val != "none":
+                    self.config["payloads"][new_name]["lighting_profile"] = int(lp_val)
+                else:
+                    self.config["payloads"][new_name].pop("lighting_profile", None)
             self.save_config()
             self.update_payloads_list()
             self.update_bindings_list()
@@ -1278,14 +1747,37 @@ class QMKManager:
     def update_payloads_list(self):
         self.payloads_column.controls.clear()
         items = self._profile_items()
-        for index in range(PROFILE_COUNT):
-            name, info = items[index] if index < len(items) else (f"Профиль {index + 1}", {"data": [], "hotkey": ""})
+        entry = self._active_device()
+        kb_type = entry.get("keyboard_type") if entry else None
+        caps = device_capabilities(kb_type)
+        for index in range(self._device_profile_count()):
+            name, info = items[index] if index < len(items) else (f"Профиль {index + 1}", {"hotkey": ""})
             hk = info.get("hotkey") or ""
-            data = info.get("data") or []
-            if data:
-                preview = ", ".join(hex(b) for b in data[:4]) + ("…" if len(data) > 4 else "")
-            else:
-                preview = "payload не загружен — запусти sniff и нажми «волшебную палочку»"
+            pr = info.get("polling_rate") if DeviceCapability.POLLING_RATE in caps else None
+            data = self._profile_payload_at(index)
+            preview = ", ".join(hex(b) for b in data[:4]) + ("…" if len(data) > 4 else "")
+
+            subtitle_parts = [ft.Text(preview, size=11,
+                                       color=ft.Colors.ON_SURFACE_VARIANT,
+                                       font_family="Consolas")]
+            if pr and pr in VALID_POLLING_RATES:
+                subtitle_parts.append(ft.Container(
+                    content=ft.Text(f"{pr} Hz", size=10, weight=ft.FontWeight.W_500,
+                                    color=ft.Colors.ON_SECONDARY_CONTAINER),
+                    padding=ft.Padding.symmetric(horizontal=6, vertical=2),
+                    bgcolor=ft.Colors.SECONDARY_CONTAINER,
+                    border_radius=100,
+                ))
+
+            lp = info.get("lighting_profile") if DeviceCapability.LIGHTING_PROFILES in caps else None
+            if lp is not None and lp in VALID_LIGHTING_PROFILES:
+                subtitle_parts.append(ft.Container(
+                    content=ft.Text(f"💡 {lp + 1}", size=10, weight=ft.FontWeight.W_500,
+                                    color=ft.Colors.ON_TERTIARY_CONTAINER),
+                    padding=ft.Padding.symmetric(horizontal=6, vertical=2),
+                    bgcolor=ft.Colors.TERTIARY_CONTAINER,
+                    border_radius=100,
+                ))
 
             hotkey_chip = (
                 ft.Container(
@@ -1315,9 +1807,7 @@ class QMKManager:
                                 ft.Column(
                                     [
                                         ft.Text(name, size=14, weight=ft.FontWeight.W_600),
-                                        ft.Text(preview, size=11,
-                                                color=ft.Colors.ON_SURFACE_VARIANT,
-                                                font_family="Consolas"),
+                                        ft.Row(subtitle_parts, spacing=6),
                                     ],
                                     spacing=0,
                                     tight=True,
@@ -1435,6 +1925,16 @@ class QMKManager:
         self.save_config()
         self.update_bindings_list()
 
+    def _on_rule_toggle(self, idx: int, enabled: bool):
+        bindings = self.config.get("bindings", [])
+        if 0 <= idx < len(bindings):
+            bindings[idx]["enabled"] = enabled
+            process = bindings[idx].get("process", "?")
+            self.rule_evaluator.set_enabled(process, enabled)
+            logger.debug("rule toggle: process=%s enabled=%s", process, enabled)
+            self.save_config()
+            self.update_bindings_list()
+
     def update_bindings_list(self):
         self.bindings_column.controls.clear()
         if not self.config["bindings"]:
@@ -1453,9 +1953,17 @@ class QMKManager:
             for i, b in enumerate(self.config["bindings"]):
                 pi = b.get("profile_index", 0)
                 pname = self._profile_name_at(pi) or f"Профиль {pi + 1}"
+                enabled = b.get("enabled", True)
+
+                toggle = ft.Switch(
+                    value=enabled,
+                    on_change=lambda e, idx=i: self._on_rule_toggle(idx, e.control.value),
+                )
+
                 row = ft.Container(
                     content=ft.Row(
                         [
+                            toggle,
                             ft.Row(
                                 [
                                     ft.Icon(ft.Icons.APPS_ROUNDED,
@@ -1499,6 +2007,7 @@ class QMKManager:
                     padding=ft.Padding.symmetric(horizontal=14, vertical=10),
                     bgcolor=ft.Colors.SURFACE_CONTAINER,
                     border_radius=14,
+                    opacity=1.0 if enabled else 0.5,
                 )
                 self.bindings_column.controls.append(row)
         self.page.update()
@@ -1673,6 +2182,8 @@ class QMKManager:
         if not data:
             return
         direction = (ev.get("dir") or "").upper()
+        ev_type = (ev.get("type") or "").lower()
+
         if direction != "TX":
             return
         logger.debug("sniff TX event type=%s reportId=%s data=%s",
@@ -1696,6 +2207,10 @@ class QMKManager:
         if self._sniff_learn_mode:
             if is_profile:
                 tag, color = "PROFILE?", ft.Colors.AMBER_400
+            elif self._matches_polling_rate_pattern(data):
+                tag, color = "POLL_RATE?", ft.Colors.GREEN_300
+            elif self._matches_lighting_profile_pattern(data):
+                tag, color = "LIGHTING?", ft.Colors.PURPLE_300
             elif ev_type == "feature":
                 tag, color = "BATTERY?", ft.Colors.LIGHT_BLUE_300
             else:
@@ -1735,9 +2250,9 @@ class QMKManager:
         # users explicitly opt in via the per-row "Сохранить" button below.
         slot_idx = data[1] if (is_profile and len(data) > 1 and data[1] in (0, 1, 2, 3)) else None
 
-        hex_str = ", ".join(f"0x{b:02x}" for b in data[:64])
+        hex_str = " ".join(f"{b:02X}" for b in data[:64])
         if len(data) > 64:
-            hex_str += f", … (+{len(data) - 64})"
+            hex_str += f" …+{len(data) - 64}"
         type_ = ev.get("type") or ""
         rid = ev.get("reportId")
         idx = len(self.sniff_events)
@@ -1755,7 +2270,8 @@ class QMKManager:
                 border_radius=6,
             ),
             ft.Text(f"{type_} id={rid}", size=11, color=ft.Colors.ON_SURFACE_VARIANT, width=110),
-            ft.Text(hex_str, size=11, selectable=True, font_family="Consolas", expand=True),
+            ft.Text(hex_str, size=10, selectable=True, font_family="Consolas",
+                    no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS, expand=True),
         ]
         if is_profile:
             label_text = f"→ слот {slot_idx + 1}" if slot_idx is not None else "→ нераспознанный слот"
@@ -1823,9 +2339,21 @@ class QMKManager:
 
     def _render_sniff_row(self, tag, color, data, report_id, ev_type, payload):
         """Render a single sniffer log row (learn mode) with auto battery probe."""
-        hex_str = ", ".join(f"0x{b:02x}" for b in data[:64])
+        hex_str = " ".join(f"{b:02X}" for b in data[:64])
         if len(data) > 64:
-            hex_str += f", … (+{len(data) - 64})"
+            hex_str += f" …+{len(data) - 64}"
+
+        extra_info = ""
+        if tag == "POLL_RATE?" and len(data) >= 3:
+            code_to_hz = {v: k.value for k, v in POLLING_RATE_CODES.items()}
+            hz = code_to_hz.get(data[2])
+            if hz:
+                extra_info = f" → {hz} Hz"
+        elif tag == "RX" and len(data) >= 2 and all(b == data[0] and b2 == data[1] for b, b2 in zip(data[0::2], data[1::2])):
+            val = data[0] | (data[1] << 8)
+            if val > 0:
+                extra_info = f" → repeated {val}"
+
         idx = len(self.sniff_events)
         battery_result_text = ft.Text("", size=11, weight=ft.FontWeight.W_600, width=80)
         controls = [
@@ -1836,7 +2364,8 @@ class QMKManager:
                 border_radius=6,
             ),
             ft.Text(f"{ev_type} id={report_id}", size=11, color=ft.Colors.ON_SURFACE_VARIANT, width=110),
-            ft.Text(hex_str, size=11, selectable=True, font_family="Consolas", expand=True),
+            ft.Text(hex_str + extra_info, size=10, selectable=True, font_family="Consolas",
+                    no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS, expand=True),
             battery_result_text,
         ]
         slot_btn = ft.PopupMenuButton(
@@ -1892,16 +2421,50 @@ class QMKManager:
             self._battery_probe_queue.put((list(data), battery_result_text))
 
     @staticmethod
+    def _matches_polling_rate_pattern(data: list) -> bool:
+        if len(data) < 8:
+            return False
+        if data[0] != 0x03 or data[1] != 0x00:
+            return False
+        if data[2] not in range(7):
+            return False
+        if any(b != 0 for b in data[3:7]):
+            return False
+        if data[7] != (255 - sum(data[0:7])) & 0xFF:
+            return False
+        if any(b != 0 for b in data[8:]):
+            return False
+        return True
+
+    @staticmethod
+    def _matches_lighting_profile_pattern(data: list) -> bool:
+        if len(data) < 9:
+            return False
+        if data[0] != 0x07 or data[1] != 0x0D or data[2] != 0x04 or data[3] != 0x04:
+            return False
+        if data[4] % 0x10 != 0 or data[4] // 0x10 >= LIGHTING_PROFILE_COUNT:
+            return False
+        if data[5] != 0 or data[6] != 0xC8 or data[7] != 0xC8:
+            return False
+        if data[8] != (511 - sum(data[0:8])) & 0xFF:
+            return False
+        if any(b != 0 for b in data[9:]):
+            return False
+        return True
+
+    @staticmethod
     def _matches_profile_pattern(data: list) -> bool:
         if len(data) < 8:
             return False
-        if data[0] not in (0x04, 0x05):
+        opcode = data[0]
+        kb_info = next((v for v in KEYBOARD_TYPES.values() if v["opcode"] == opcode), None)
+        if kb_info is None:
             return False
-        if data[1] not in (0, 1, 2, 3):
+        if data[1] not in range(kb_info["profiles"]):
             return False
         if any(b != 0 for b in data[2:7]):
             return False
-        expected_check = ((0xFB - data[1]) & 0xFF) if data[0] == 0x04 else ((0xFA - data[1]) & 0xFF)
+        expected_check = (kb_info["checksum_base"] - data[1]) & 0xFF
         if data[7] != expected_check:
             return False
         if any(b != 0 for b in data[8:]):
@@ -2086,6 +2649,7 @@ class QMKManager:
                 get_device_path=self.get_keyboard_path_safe,
                 get_device_paths=self.get_keyboard_paths,
                 on_working_path=self._cache_working_path,
+                default_query=DEFAULT_BATTERY_QUERY,
             )
             monitor.read_once()
             state = monitor.state
@@ -2134,10 +2698,11 @@ class QMKManager:
         """Save the actually-observed payload for the specific slot only.
         Preserves other slots' existing payloads — no synthesizing payload[1]=idx,
         which produced bytes the keyboard never sent and silently broke switching."""
-        if not (0 <= index < PROFILE_COUNT):
+        _pc = self._device_profile_count()
+        if not (0 <= index < _pc):
             return
         items = self._profile_items()
-        while len(items) < PROFILE_COUNT:
+        while len(items) < _pc:
             items.append((f"Профиль {len(items) + 1}", {"data": [], "hotkey": ""}))
         name, info = items[index]
         info = dict(info or {})
@@ -2171,11 +2736,12 @@ class QMKManager:
                 self.sniff_status.value = "Не похоже на профильный payload."
                 self.page.update()
             return
+        _pc = self._device_profile_count()
         items = self._profile_items()
-        while len(items) < PROFILE_COUNT:
+        while len(items) < _pc:
             items.append((f"Профиль {len(items) + 1}", {"data": [], "hotkey": ""}))
         new_payloads = {}
-        for idx in range(PROFILE_COUNT):
+        for idx in range(_pc):
             name, info = items[idx]
             payload = list(sample_data)
             payload[1] = idx
@@ -2325,18 +2891,67 @@ class QMKManager:
         self._working_hid_path[cache_key] = path
         logger.debug("cached working HID path from battery: %s", path)
 
+    def _diagnose_hid_endpoints(self):
+        dev = self.config.get("device") or {}
+        if not dev:
+            return
+        vid, pid = dev.get("vid", 0), dev.get("pid", 0)
+        vendor_paths = []
+        for d in hid.enumerate(vid, pid):
+            if d["usage_page"] == 0xFFFF:
+                vendor_paths.append({
+                    "path": d["path"],
+                    "usage": d["usage"],
+                    "interface": d.get("interface_number", -1),
+                })
+        safe_query_data = [0xF7] + [0x00] * 63
+        test_sizes = [8, 16, 32, 33, 64]
+        logger.debug("=== HID endpoint diagnostic ===")
+        for ep in vendor_paths:
+            path = ep["path"]
+            logger.debug("--- probing path=%s usage=0x%04x interface=%d ---",
+                         path, ep["usage"], ep["interface"])
+            for data_size in test_sizes:
+                report = [0x00] + safe_query_data[:data_size]
+                try:
+                    device = hid.device()
+                    device.open_path(path)
+                    device.set_nonblocking(1)
+                    rc = device.send_feature_report(report)
+                    response = None
+                    if rc is not None and rc > 0:
+                        try:
+                            response = device.get_feature_report(0, len(report))
+                        except Exception:
+                            pass
+                    device.close()
+                    logger.debug("  size=%d(+1) rc=%s response=%s",
+                                 data_size, rc,
+                                 [f"0x{b:02x}" for b in response[:16]] if response else None)
+                except Exception as exc:
+                    logger.debug("  size=%d(+1) EXCEPTION: %s", data_size, exc)
+                    try:
+                        device.close()
+                    except Exception:
+                        pass
+        logger.debug("=== end HID endpoint diagnostic ===")
+
     def battery_poll_loop(self):
         logger.info("battery poll loop started (60s interval)")
         print("[Battery] Поток опроса батареи запущен (каждые 60 сек).")
         while self.app_alive:
             try:
-                self.battery_monitor.read_once()
-                state = self.battery_monitor.state
-                logger.debug("battery poll: percent=%s charging=%s stale=%s",
-                             state.percent, state.charging, state.is_stale)
-                if self.tray:
-                    self.tray.update_battery(state)
-                self.publish_battery_to_ui(state)
+                entry = self._active_device()
+                if entry and entry.get("keyboard_type") is None:
+                    logger.debug("battery poll skipped: keyboard_type not configured")
+                else:
+                    self.battery_monitor.read_once()
+                    state = self.battery_monitor.state
+                    logger.debug("battery poll: percent=%s charging=%s stale=%s",
+                                 state.percent, state.charging, state.is_stale)
+                    if self.tray:
+                        self.tray.update_battery(state)
+                    self.publish_battery_to_ui(state)
             except Exception as e:
                 print(f"[Battery] Ошибка цикла опроса: {e}")
             for _ in range(60):
@@ -2368,7 +2983,26 @@ class QMKManager:
                 pass
         self._ui_call(do)
 
+    def _refresh_battery_for_tray(self):
+        """Read battery and update tray icon immediately (non-blocking thread)."""
+        def _do():
+            try:
+                entry = self._active_device()
+                if entry and entry.get("keyboard_type") is None:
+                    return
+                self.battery_monitor.read_once()
+                state = self.battery_monitor.state
+                if self.tray:
+                    self.tray.update_battery(state)
+                self.publish_battery_to_ui(state)
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True).start()
+
     def _manual_battery_refresh(self):
+        entry = self._active_device()
+        if entry and entry.get("keyboard_type") is None:
+            return
         self.battery_monitor.read_once()
         state = self.battery_monitor.state
         if self.tray:
@@ -2402,8 +3036,162 @@ class QMKManager:
     def _on_transport_override_change(self, e):
         return
 
-    def _set_device_transport(self, vid, pid, usage_page, transport):
-        if transport not in ("wired", "wireless"):
+    def _show_setup_wizard(self, device_key: str):
+        if not device_key:
+            return
+        entry = self.config["devices"].get(device_key)
+        if not entry:
+            return
+        if entry.get("keyboard_type") in KEYBOARD_TYPES:
+            return
+        logger.info("Setup wizard opened for device %s (%s)", device_key, entry.get("label", ""))
+
+        label = entry.get("label") or "Unknown Device"
+        vid = entry.get("vid", 0)
+        pid = entry.get("pid", 0)
+
+        type_dropdown = ft.Dropdown(
+            label="Тип клавиатуры",
+            hint_text="Выберите тип...",
+            options=[
+                ft.dropdown.Option(key="magnetic", text="Магнитная"),
+                ft.dropdown.Option(key="mechanical", text="Механическая"),
+            ],
+            border_radius=12,
+            filled=True,
+            width=350,
+        )
+
+        confirm_checkbox = ft.Checkbox(
+            label="Я подтверждаю, что тип клавиатуры выбран правильно",
+            value=False,
+        )
+
+        save_btn = ft.ElevatedButton("Сохранить", disabled=True)
+
+        def _update_save_state(_=None):
+            save_btn.disabled = not (type_dropdown.value and confirm_checkbox.value)
+            try:
+                self.page.update()
+            except Exception:
+                pass
+
+        confirm_checkbox.on_change = lambda e: _update_save_state()
+
+        def _on_save(_):
+            kb_type = type_dropdown.value
+            if kb_type not in KEYBOARD_TYPES:
+                return
+            logger.info("Setup completed: device %s configured as %s", device_key, kb_type)
+            try:
+                self.page.pop_dialog()
+            except Exception:
+                pass
+            self._set_keyboard_type(vid, pid, entry.get("usage_page", 0), kb_type)
+
+        def _on_cancel(_):
+            logger.info("Setup wizard cancelled for device %s", device_key)
+            try:
+                self.page.pop_dialog()
+            except Exception:
+                pass
+            if self.config.get("active_device") == device_key:
+                prev_keys = [k for k in self.config["devices"]
+                             if k != device_key and self.config["devices"][k].get("keyboard_type") in KEYBOARD_TYPES]
+                new_active = prev_keys[0] if prev_keys else None
+                if new_active:
+                    self._activate_device(new_active)
+                    self.device_dropdown.value = new_active
+                else:
+                    self.config["active_device"] = None
+                    self._ensure_active_device_aliases()
+                    self.device_dropdown.value = None
+                try:
+                    self.page.update()
+                except Exception:
+                    pass
+
+        save_btn.on_click = _on_save
+
+        mech_section = ft.Column([
+            ft.Divider(height=1, color=ft.Colors.AMBER_200),
+            ft.Row([
+                ft.Icon(ft.Icons.SPEED_ROUNDED, color=ft.Colors.RED_700, size=20),
+                ft.Text("ЗАДЕРЖКА ПЕРЕКЛЮЧЕНИЯ", weight=ft.FontWeight.BOLD, color=ft.Colors.RED_700, size=13),
+            ], spacing=8),
+            ft.Text(
+                "На механических клавиатурах смена профиля происходит с задержкой. "
+                "Не нажимайте клавиши, пока подсветка не выключится и не включится "
+                "снова — это сигнал, что профиль применён. Держите подсветку включённой.",
+                size=12,
+                color=ft.Colors.RED_900,
+            ),
+        ], spacing=6, visible=False)
+
+        warning_col = ft.Column([
+            ft.Row([
+                ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, color=ft.Colors.AMBER_700, size=24),
+                ft.Text("ВНИМАНИЕ", weight=ft.FontWeight.BOLD, color=ft.Colors.AMBER_700, size=16),
+            ], spacing=8),
+            ft.Text(
+                "Неправильный выбор типа клавиатуры приведёт к отправке "
+                "несовместимых HID-команд на устройство. Это может вызвать "
+                "нестабильную работу, залипание клавиш или повреждение "
+                "конфигурации профилей.",
+                size=13,
+                color=ft.Colors.AMBER_900,
+            ),
+            mech_section,
+        ], spacing=6)
+
+        warning_block = ft.Container(
+            content=warning_col,
+            bgcolor=ft.Colors.AMBER_50,
+            border=ft.Border(
+                ft.BorderSide(1, ft.Colors.AMBER_200),
+                ft.BorderSide(1, ft.Colors.AMBER_200),
+                ft.BorderSide(1, ft.Colors.AMBER_200),
+                ft.BorderSide(1, ft.Colors.AMBER_200),
+            ),
+            border_radius=12,
+            padding=ft.Padding(left=16, top=12, right=16, bottom=12),
+        )
+
+        def _on_type_change(_=None):
+            mech_section.visible = (type_dropdown.value == "mechanical")
+            mech_section.update()
+            _update_save_state()
+
+        type_dropdown.on_change = _on_type_change
+
+        content = ft.Column([
+            ft.Text(f"Устройство: {label}", size=14, weight=ft.FontWeight.W_500),
+            ft.Text(f"VID: 0x{vid:04X}   PID: 0x{pid:04X}", size=12,
+                    color=ft.Colors.ON_SURFACE_VARIANT),
+            ft.Divider(height=16, color=ft.Colors.TRANSPARENT),
+            type_dropdown,
+            ft.Divider(height=8, color=ft.Colors.TRANSPARENT),
+            warning_block,
+            ft.Divider(height=8, color=ft.Colors.TRANSPARENT),
+            confirm_checkbox,
+        ], spacing=4, tight=True, width=400)
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("⌨ Настройка клавиатуры", size=20, weight=ft.FontWeight.BOLD),
+            content=content,
+            actions=[
+                ft.TextButton("Отмена", on_click=_on_cancel),
+                save_btn,
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+            shape=ft.RoundedRectangleBorder(radius=20),
+        )
+
+        self.page.show_dialog(dlg)
+
+    def _set_keyboard_type(self, vid, pid, usage_page, kb_type):
+        if kb_type not in ("magnetic", "mechanical"):
             return
         key = self._device_key(vid, pid, usage_page)
         entry = self.config["devices"].get(key)
@@ -2418,16 +3206,40 @@ class QMKManager:
             entry = self._empty_device_entry(vid, pid, usage_page, label=self._device_label_for(hid_dev))
             self.config["devices"][key] = entry
             self._normalize_device_entry(entry)
-        entry["transport"] = transport
-        entry["transport_locked"] = True
+        entry["keyboard_type"] = kb_type
+        transport = entry.get("transport")
+        if kb_type == "mechanical":
+            default_cooldown = 2000 if transport == "wireless" else 1000
+        else:
+            default_cooldown = 250 if transport == "wireless" else 100
+        entry["cooldown_ms"] = default_cooldown
+        self._normalize_device_entry(entry)
         self.save_config()
+        if key == self.config.get("active_device"):
+            self._ensure_active_device_aliases()
+            was_running = self.is_running
+            if was_running:
+                self.is_running = False
+                try:
+                    keyboard.unhook_all()
+                except Exception:
+                    pass
+            try:
+                self.update_payloads_list()
+            except Exception:
+                pass
+            try:
+                self.update_bindings_list()
+            except Exception:
+                pass
+            if was_running:
+                self.is_running = True
+                self.reload_runtime_state()
+                self._set_status(True)
+                if not self.worker_thread or not self.worker_thread.is_alive():
+                    self.worker_thread = threading.Thread(target=self.background_task, daemon=True)
+                    self.worker_thread.start()
         self.refresh_devices()
-        try:
-            self._update_transport_icon()
-        except Exception:
-            pass
-
-    def _sync_transport_override_ui(self):
         try:
             self._update_transport_icon()
         except Exception:
@@ -2455,82 +3267,153 @@ class QMKManager:
         except Exception:
             upd()
 
-    def apply_payload(self, profile_name, payload_data, manual=False):
+    def _send_hid_payload(self, payload_data, label="payload"):
+        """Send a single HID feature report to all matching paths. Returns first successful path or None.
+        Caller must hold self.usb_lock."""
         full_report = [0x00] + payload_data
-        logger.debug("apply_payload profile=%s manual=%s report_id=0x00 "
-                      "full_report[:%d]=%s payload_len=%d",
-                      profile_name, manual, min(len(full_report), 16),
-                      [f"0x{b:02x}" for b in full_report[:16]], len(payload_data))
-        with self.usb_lock:
-            paths = self.get_keyboard_paths()
-            if not paths:
-                logger.warning("apply_payload: no HID paths found for device")
-                print("[Ошибка] Устройство USB не найдено для отправки.")
-                return
-            logger.debug("apply_payload: %d HID path(s) to try", len(paths))
-            dev = self.config.get("device") or {}
-            cache_key = self._device_key(dev.get("vid", 0), dev.get("pid", 0), dev.get("usage_page", 0))
-            sent_path = None
-            last_err = None
-            for path in paths:
-                try:
-                    device = hid.device()
-                    device.open_path(path)
-                    device.set_nonblocking(1)
-                    rc = device.send_feature_report(full_report)
-                    logger.debug("apply_payload send_feature_report path=%s rc=%s", path, rc)
-                    read_back = None
-                    if rc is not None and rc > 0:
-                        try:
-                            read_back = device.get_feature_report(0, min(len(full_report), 65))
-                            logger.debug("apply_payload read_back=%s",
-                                         [f"0x{b:02x}" for b in read_back[:16]] if read_back else None)
-                        except Exception as rb_err:
-                            logger.debug("apply_payload read_back failed: %s", rb_err)
-                    device.close()
-                except Exception as e:
-                    last_err = e
-                    try:
-                        device.close()
-                    except Exception:
-                        pass
-                    continue
-                # hid.device.send_feature_report возвращает число записанных байт
-                # (>0 на успехе, -1 при ошибке). Часть драйверов в проводе на «глухом»
-                # интерфейсе тоже отдаёт 0/положительное — поэтому если активных
-                # путей несколько, шлём во все, но фиксируем первый, который не упал.
-                if rc is None or rc > 0:
-                    sent_path = sent_path or path
-            if sent_path is None:
-                logger.warning("apply_payload FAILED on all paths, last_err=%s", last_err)
-                print(f"[Ошибка USB] Не удалось отправить HID пакет ни в один интерфейс: {last_err}")
-                return
-            self._working_hid_path[cache_key] = sent_path
-            logger.debug("apply_payload SUCCESS on path=%s", sent_path)
+        logger.debug("_send_hid_payload [%s] report[:%d]=%s",
+                      label, min(len(full_report), 16),
+                      [f"0x{b:02x}" for b in full_report[:16]])
+        paths = self.get_keyboard_paths()
+        if not paths:
+            logger.warning("_send_hid_payload [%s]: no HID paths found", label)
+            return None
+        dev = self.config.get("device") or {}
+        cache_key = self._device_key(dev.get("vid", 0), dev.get("pid", 0), dev.get("usage_page", 0))
+        sent_path = None
+        last_err = None
+        for path in paths:
             try:
-                if manual:
+                device = hid.device()
+                device.open_path(path)
+                device.set_nonblocking(1)
+                rc = device.send_feature_report(full_report)
+                logger.debug("_send_hid_payload [%s] path=%s rc=%s", label, path, rc)
+                if rc is not None and rc > 0:
                     try:
-                        hwnd = win32gui.GetForegroundWindow()
-                        _, pid_ = win32process.GetWindowThreadProcessId(hwnd)
-                        self.last_active_window = psutil.Process(pid_).name().lower()
-                    except Exception:
-                        pass
-
-                self.current_binding = profile_name
-                trigger = "Hotkey" if manual else "Авто"
-                print(f"[{trigger}] Успешно применен профиль: {profile_name} (path={sent_path!r})")
-
-                try:
-                    Notification(
-                        app_id='QMK.Top Manager',
-                        title=f'Профиль: {profile_name.upper()}',
-                        msg=f'Применен профиль ({trigger})',
-                        duration='short',
-                    ).show()
-                except Exception as e:
-                    print(f"[Уведомление] Ошибка: {e}")
+                        read_back = device.get_feature_report(0, min(len(full_report), 65))
+                        logger.debug("_send_hid_payload [%s] read_back=%s", label,
+                                     [f"0x{b:02x}" for b in read_back[:16]] if read_back else None)
+                    except Exception as rb_err:
+                        logger.debug("_send_hid_payload [%s] read_back failed: %s", label, rb_err)
+                device.close()
             except Exception as e:
-                print(f"[Ошибка] Пост-обработка применения профиля: {e}")
+                last_err = e
+                try:
+                    device.close()
+                except Exception:
+                    pass
+                continue
+            if rc is None or rc > 0:
+                sent_path = sent_path or path
+                if rc is not None and rc > 0:
+                    break
+        if sent_path:
+            self._working_hid_path[cache_key] = sent_path
+        else:
+            logger.warning("_send_hid_payload [%s] FAILED on all paths, last_err=%s", label, last_err)
+        return sent_path
+
+    def apply_payload(self, profile_name, payload_data, manual=False):
+        entry = self._active_device()
+        if entry and entry.get("keyboard_type") is None:
+            logger.warning("HID write blocked: device %s has no keyboard_type configured",
+                           self.config.get("active_device"))
+            self._ui_call(lambda: self._show_setup_wizard(self.config.get("active_device")))
+            return
+        logger.debug("apply_payload profile=%s manual=%s payload[:%d]=%s",
+                      profile_name, manual, min(len(payload_data), 16),
+                      [f"0x{b:02x}" for b in payload_data[:16]])
+
+        kb_type = entry.get("keyboard_type") if entry else None
+        caps = device_capabilities(kb_type)
+        logger.debug("apply_payload: keyboard_type=%s caps=%s", kb_type, caps)
+
+        cooldown_ms = _resolved_cooldown_ms(entry)
+        hook = None
+        if cooldown_ms > 0:
+            _release_all_keys()
+            hook = _suppress_keyboard_start()
+            logger.debug("apply_payload: keyboard suppressed (transaction-bound, device %s)",
+                         self.config.get("active_device"))
+
+        sent_path = None
+        try:
+            with self.usb_lock:
+                # 1. Profile switch first — keymap is the primary operation
+                sent_path = self._send_hid_payload(payload_data, label=f"profile_{profile_name}")
+                if sent_path is None:
+                    logger.error("profile switch FAILED for %s", profile_name)
+                    print("[Ошибка USB] Не удалось отправить HID пакет ни в один интерфейс.")
+                    return
+
+                time.sleep(_stage_delay_ms(entry, "profile") / 1000.0)
+
+                info = self._profile_info_at_by_name(profile_name)
+
+                # 2. Polling rate (capability-gated)
+                if DeviceCapability.POLLING_RATE in caps and info:
+                    pr = info.get("polling_rate")
+                    if pr and pr in VALID_POLLING_RATES:
+                        logger.debug("apply_payload: sending polling rate %d Hz", pr)
+                        pr_path = self._send_hid_payload(
+                            _polling_rate_payload(PollingRate(pr)),
+                            label=f"polling_rate_{pr}Hz")
+                        if pr_path:
+                            time.sleep(_stage_delay_ms(entry, "polling") / 1000.0)
+                        else:
+                            logger.warning("apply_payload: polling rate send FAILED")
+
+                # 3. Lighting profile after profile stabilizes (capability-gated)
+                if DeviceCapability.LIGHTING_PROFILES in caps and info:
+                    lp = info.get("lighting_profile")
+                    if lp is not None and lp in VALID_LIGHTING_PROFILES:
+                        logger.debug("apply_payload: sending lighting profile %d after profile switch", lp + 1)
+                        lp_path = self._send_hid_payload(
+                            _lighting_profile_payload(lp),
+                            label=f"lighting_profile_{lp + 1}")
+                        if lp_path:
+                            time.sleep(_stage_delay_ms(entry, "lighting") / 1000.0)
+                        else:
+                            logger.warning("apply_payload: lighting profile send FAILED")
+                elif DeviceCapability.LIGHTING_PROFILES not in caps:
+                    logger.debug("apply_payload: lighting subsystem DISABLED for %s", kb_type)
+
+                if entry.get("battery", {}).get("query"):
+                    self._refresh_battery_for_tray()
+        finally:
+            if hook is not None:
+                try:
+                    keyboard.unhook(hook)
+                except Exception:
+                    pass
+                logger.debug("apply_payload: keyboard suppression removed after transaction")
+
+        if sent_path is None:
+            return
+
+        if manual:
+            try:
+                hwnd = win32gui.GetForegroundWindow()
+                _, pid_ = win32process.GetWindowThreadProcessId(hwnd)
+                self.last_active_window = psutil.Process(pid_).name().lower()
+            except Exception:
+                pass
+
+        self.current_binding = profile_name
+        trigger = "Hotkey" if manual else "Авто"
+        print(f"[{trigger}] Успешно применен профиль: {profile_name} (path={sent_path!r})")
+
+        try:
+            if self.config.get("settings", {}).get("notifications", True):
+                Notification(
+                    app_id='QMK.Top Manager',
+                    title=f'Профиль: {profile_name.upper()}',
+                    msg=f'Применен профиль ({trigger})',
+                    duration='short',
+                ).show()
+        except Exception as e:
+            print(f"[Уведомление] Ошибка: {e}")
 
     def background_task(self):
         logger.info("background window scanner started")
@@ -2557,16 +3440,36 @@ class QMKManager:
                         print(f"[DEBUG] Активное окно: '{active_process}'")
                         self.last_active_window = active_process
 
-                        target_pi = None
-                        if active_process in self.binds_dict:
-                            target_pi = self.binds_dict[active_process]
-                        elif self.default_profile_index is not None:
-                            target_pi = self.default_profile_index
+                        target_pi = self.rule_evaluator.match(active_process)
                         if target_pi is not None:
-                            info = self._profile_info_at(target_pi)
+                            logger.debug("rule matched: process=%s → profile_index=%d", active_process, target_pi)
+                        else:
+                            disabled = self.rule_evaluator.is_disabled_match(active_process)
+                            if disabled:
+                                logger.debug("rule SKIPPED (disabled): process=%s → profile_index=%d",
+                                             active_process, disabled.profile_index)
+                            if self.default_profile_index is not None:
+                                target_pi = self.default_profile_index
+                        if target_pi is not None:
+                            entry = self._active_device()
+                            if entry and entry.get("keyboard_type") is None:
+                                continue
                             name = self._profile_name_at(target_pi)
-                            if info and info.get("data") and name and name != self.current_binding:
-                                self.apply_payload(name, info["data"], manual=False)
+                            payload = self._profile_payload_at(target_pi)
+                            if name and name != self.current_binding:
+                                time.sleep(0.2)
+                                try:
+                                    hwnd2 = win32gui.GetForegroundWindow()
+                                    _, pid2 = win32process.GetWindowThreadProcessId(hwnd2)
+                                    recheck = psutil.Process(pid2).name().lower()
+                                except Exception:
+                                    recheck = active_process
+                                if recheck == active_process:
+                                    self.apply_payload(name, payload, manual=False)
+                                else:
+                                    logger.debug("debounce: process changed during wait (%s→%s), skipping",
+                                                 active_process, recheck)
+                                    self.last_active_window = None
             except Exception as e:
                 print(f"[GLOBAL ERROR] Сбой в цикле сканирования: {e}")
             time.sleep(1)
@@ -2666,12 +3569,13 @@ class QMKManager:
             if not self._first_minimize_notified:
                 self._first_minimize_notified = True
                 try:
-                    Notification(
-                        app_id='QMK.Top Manager',
-                        title='QMK.Top Manager',
-                        msg='Программа продолжает работать в трее. Выйти можно из меню иконки.',
-                        duration='short',
-                    ).show()
+                    if self.config.get("settings", {}).get("notifications", True):
+                        Notification(
+                            app_id='QMK.Top Manager',
+                            title='QMK.Top Manager',
+                            msg='Программа продолжает работать в трее. Выйти можно из меню иконки.',
+                            duration='short',
+                        ).show()
                 except Exception:
                     pass
 
@@ -2696,7 +3600,31 @@ def _should_start_minimized() -> bool:
 
 
 if __name__ == "__main__":
-    if _should_start_minimized():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--startup", action="store_true",
+                        help="Launched by Windows autostart")
+    args = parser.parse_args()
+
+    if not acquire_single_instance():
+        bring_existing_to_front()
+        sys.exit(0)
+
+    os.chdir(paths.app_dir)
+
+    is_startup = args.startup
+
+    if is_startup:
+        config_data = {}
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+        except Exception:
+            pass
+        delay = config_data.get("settings", {}).get("startup_delay_sec", 5)
+        if delay > 0:
+            time.sleep(delay)
+
+    if is_startup or _should_start_minimized():
         ft.run(main, view=ft.AppView.FLET_APP_HIDDEN)
     else:
         ft.run(main)
