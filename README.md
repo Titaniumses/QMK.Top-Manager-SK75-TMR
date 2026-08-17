@@ -182,8 +182,9 @@ The one-file result is `dist\QMK.Top Manager for SK75 TMR.exe`; a neighboring `*
 ---
 
 ## Screenshots
-
-*Coming soon*
+![Magnetic Lab](assets/screenshots/magnetic-lab.png,assets/screenshots/magnetic-lab2.png)
+![Travel Tester](assets/screenshots/travel-tester.png)
+![main-window](assets/screenshots/main-window.png)
 
 ## License
 
